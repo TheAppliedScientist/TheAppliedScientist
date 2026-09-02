@@ -1,0 +1,91 @@
+name: theappliedscientist
+
+services:
+  search-api:
+    profiles: ["search"]
+    build:
+      context: ./components/search-api
+    image: theappliedscientist/search-api:stable
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8081"
+      GEMINI_INDEX_DIR: /data/arxiv_gemini_index
+    ports:
+      - "${SEARCH_API_PORT:-8081}:8081"
+    volumes:
+      - ${GEMINI_INDEX_DIR:-./data/search-index/arxiv_gemini_index}:/data/arxiv_gemini_index:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20m
+
+  ai-reviewer:
+    profiles: ["reviewer"]
+    build:
+      context: ./components/ai-reviewer
+    image: theappliedscientist/ai-reviewer:stable
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REVIEW_API_PORT: "8082"
+      # The API container itself is the local sandbox boundary. No remote
+      # execution service is used.
+      REVIEW_EXECUTION_BACKEND: native
+      CLAUDE_REVIEW_BIN: /opt/claude-reviewer/claude
+      ANTHROPIC_BASE_URL: ${REVIEW_ANTHROPIC_BASE_URL:-${ANTHROPIC_BASE_URL}}
+      ANTHROPIC_API_KEY: ${REVIEW_ANTHROPIC_API_KEY:-${ANTHROPIC_API_KEY}}
+      ANTHROPIC_AUTH_TOKEN: ${REVIEW_ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      SEARCH_PUBLIC_URL: ${REVIEWER_SEARCH_API_URL:-http://host.docker.internal:8081}
+      TRAJECTORY_ARCHIVE_DIR: /data/trajectories
+    ports:
+      - "${REVIEW_API_PORT:-8082}:8082"
+    volumes:
+      - review-trajectories:/data/trajectories
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # On-demand tool container. Use through `./tas run ...`; it is not started by `up`.
+  # Mounting the Docker socket lets Harbor create sibling experiment containers.
+  ai-scientist:
+    profiles: ["scientist"]
+    build:
+      context: ./components/ai-scientist
+      dockerfile: Dockerfile.runner
+    image: theappliedscientist/ai-scientist:stable
+    env_file: .env
+    environment:
+      TAS_TASK_TMPDIR: ${TAS_PROJECT_ROOT}/components/ai-scientist/.runtime/tasks
+      REVIEW_API_URL: ${SCIENTIST_REVIEW_API_URL:-http://host.docker.internal:8082}
+      SEARCH_PUBLIC_URL: ${SCIENTIST_SEARCH_API_URL:-http://host.docker.internal:8081}
+      ANTHROPIC_BASE_URL: ${SCIENTIST_ANTHROPIC_BASE_URL:-${ANTHROPIC_BASE_URL}}
+      ANTHROPIC_API_KEY: ${SCIENTIST_ANTHROPIC_API_KEY:-${ANTHROPIC_API_KEY}}
+      ANTHROPIC_AUTH_TOKEN: ${SCIENTIST_ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}
+      ANTHROPIC_MODEL: ${SCIENTIST_ANTHROPIC_MODEL:-${ANTHROPIC_MODEL}}
+      ANTHROPIC_DEFAULT_OPUS_MODEL: ""
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ""
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: ""
+      CLAUDE_CODE_SUBAGENT_MODEL: ""
+      CLAUDE_CODE_EFFORT_LEVEL: ""
+      TAS_ENV_LOADED: "1"
+    working_dir: ${TAS_PROJECT_ROOT}/components/ai-scientist
+    volumes:
+      # The identical host/container path is required because the mounted Docker
+      # daemon resolves Harbor build contexts on the host filesystem.
+      - ${TAS_PROJECT_ROOT}/components/ai-scientist:${TAS_PROJECT_ROOT}/components/ai-scientist
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["./run.sh"]
+
+volumes:
+  review-trajectories:
+    name: theappliedscientist-review-trajectories

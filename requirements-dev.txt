@@ -1,0 +1,3 @@
+pytest==8.4.2
+-r components/ai-scientist/requirements.txt
+httpx

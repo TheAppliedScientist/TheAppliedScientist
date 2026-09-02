@@ -1,0 +1,28 @@
+{
+  "Name": "improve_example_with_reviews",
+  "Title": "Example Paper: Addressing Public Reviewer Concerns",
+  "Short Hypothesis": "A stronger baseline and a held-out evaluation will resolve the main validity concern.",
+  "Task": "Download and read the paper source and code listed in Paper. Reproduce the main baseline before changing the method. Address every public-review weakness with real experiments, report all executed results honestly, write a revised paper, and iterate using the configured AI Reviewer. Complete at least one baseline and one new experiment before the first AI review.",
+  "Paper": {
+    "paper_url": "https://arxiv.org/abs/2401.01234",
+    "source_url": "https://arxiv.org/e-print/2401.01234",
+    "code_url": "https://github.com/example/project"
+  },
+  "Human_Reviews_From_OpenReview": {
+    "review_1": {
+      "summary": "Paste the review summary here.",
+      "strengths": "Paste the strengths here.",
+      "weaknesses": "Paste the weaknesses here without rewriting them.",
+      "questions": "Paste the reviewer questions here.",
+      "limitations": "Paste any limitation comments here.",
+      "rating": 5,
+      "confidence": 4
+    }
+  },
+  "What_NOT_To_Do": "Do not fabricate results, omit failed runs, or claim that a concern is fixed without evidence.",
+  "GPU_Needed": false,
+  "_meta": {
+    "arxiv_id": "2401.01234",
+    "openreview_url": "https://openreview.net/forum?id=replace-me"
+  }
+}

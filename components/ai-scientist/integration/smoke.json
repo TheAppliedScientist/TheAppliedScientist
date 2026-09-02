@@ -1,0 +1,7 @@
+{
+  "Name": "theappliedscientist_integration_smoke",
+  "Title": "TheAppliedScientist Local Integration Verification",
+  "Task": "This is a bounded deployment integration test, not a full research run. Use /app/search for one literature query. Create experiment_codebase/integration_result.json with the observed search result. Write and compile a minimal valid paper at latex/template.tex that reports only that check. Submit the paper exactly once with scripts/submit_for_review.sh, confirm that the review is saved, copy the required artifacts to /logs/agent/artifacts, and finish. Do not download datasets, train models, clone repositories, or start another review round.",
+  "What_NOT_To_Do": "Do not invent results. Do not run expensive experiments. Submit exactly one review and then stop.",
+  "HOW_TO_RUN_EXPERIMENTS": "Run /app/search batch with one query, compile latex/template.tex, and run scripts/submit_for_review.sh once. Record the literal success or failure of Search and Reviewer."
+}

@@ -1,0 +1,6 @@
+# The cleaned Reviewer executes Claude Code inside its own local container or
+# direct-host workspace and therefore needs no remote/local sandbox framework.
+aiohttp==3.13.5
+python-dotenv==1.2.2
+loguru==0.7.3
+PyYAML==6.0.3

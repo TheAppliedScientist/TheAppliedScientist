@@ -1,0 +1,23 @@
+.env
+.runtime/
+.venvs/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Large/runtime data
+data/
+jobs/
+results/
+trials/
+components/search-api/.index/
+components/ai-scientist/jobs/
+components/ai-scientist/data/
+components/ai-scientist/.runtime/
+components/ai-scientist/.venv/
+components/ai-scientist/harbor-task/environment/Dockerfile
+components/ai-scientist/harbor-task/environment/.env
+components/ai-scientist/harbor-task/environment/prev_artifacts/
+

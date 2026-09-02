@@ -1,0 +1,1628 @@
+"""AI Scientist v3 — Live Job Viewer. FastAPI backend + serves HTML templates."""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from sse_starlette.sse import EventSourceResponse
+
+from parse_trajectory import (
+    ParseResult,
+    compute_cumulative_tokens,
+    compute_event_type_breakdown,
+    compute_tool_breakdown,
+    detect_and_parse,
+    estimate_cost,
+    find_agent_activity_path,
+    find_artifacts_dir,
+    find_trajectory_path,
+    mask_secrets,
+    mask_secrets_in_text,
+)
+from trajectory_index import (
+    generate_index,
+    get_or_generate_index,
+    read_single_step,
+)
+from gitlab_client import GitLabClient
+
+app = FastAPI(title="AI Scientist v3 — Job Viewer")
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # gzip responses >1KB
+
+# Global config — set by CLI args
+JOBS_DIR = "./jobs"
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
+REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+# Resolve Python with harbor available: prefer the project venv (.venv/bin/python3),
+# fall back to uv tool install location, then system python as last resort.
+def _find_harbor_python() -> str:
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), ".venv", "bin", "python3"),  # project venv
+        os.path.expanduser("~/.local/share/uv/tools/harbor/bin/python3"),  # uv tool install
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return sys.executable  # fallback: current python (may lack harbor)
+
+HARBOR_PYTHON = _find_harbor_python()
+GENERATE_ATIF_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts", "backfill_trajectory.py")
+# Data source mode: "local" (disk only), "gitlab" (GitLab API only).
+SOURCE_MODE = "local"
+# Parsed event/cache metadata per job to keep /api/jobs fast across refreshes.
+JOB_PARSE_CACHE: Dict[str, dict] = {}
+JOB_METRICS_CACHE: Dict[str, dict] = {}
+JOBS_LIST_CACHE: Dict[str, Any] = {
+    "jobs_dir": None,
+    "expires_at": 0.0,
+    "payload": None,
+}
+JOBS_LIST_CACHE_TTL_SEC = 15.0
+GITLAB_MAP_REFRESH_SEC = 300.0  # Refresh GITLAB_JOB_MAP every 5 minutes
+
+
+def _safe_job_id(job_id: str) -> bool:
+    """Reject job IDs containing path traversal sequences."""
+    return bool(job_id) and ".." not in job_id and "/" not in job_id and "\\" not in job_id
+
+
+@app.middleware("http")
+async def validate_job_id(request: Request, call_next):
+    """Block path traversal in job_id parameters."""
+    path = request.url.path
+    if path.startswith("/api/jobs/"):
+        parts = path.split("/")
+        if len(parts) >= 4:
+            job_id = parts[3]
+            if not _safe_job_id(job_id):
+                return JSONResponse({"error": "Invalid job ID"}, status_code=400)
+    return await call_next(request)
+
+# GitLab client — initialized if GITLAB_KEY is set and SOURCE_MODE is "gitlab".
+GITLAB_CLIENT: Optional[GitLabClient] = None
+# Maps job_id -> (project_id, branch) for GitLab-backed jobs.
+GITLAB_JOB_MAP: Dict[str, Tuple[int, str]] = {}
+async def _refresh_gitlab_job_map():
+    """Periodically refresh GITLAB_JOB_MAP so new jobs appear without restart."""
+    while True:
+        await asyncio.sleep(GITLAB_MAP_REFRESH_SEC)
+        if not GITLAB_CLIENT:
+            continue
+        try:
+            gl_jobs = GITLAB_CLIENT.discover_gitlab_jobs()
+            new_map: Dict[str, Tuple[int, str]] = {}
+            for gj in gl_jobs:
+                if gj.get("_project_id") and gj.get("_branch"):
+                    new_map[gj["id"]] = (gj["_project_id"], gj["_branch"])
+            GITLAB_JOB_MAP.clear()
+            GITLAB_JOB_MAP.update(new_map)
+            JOBS_LIST_CACHE["expires_at"] = 0.0  # Invalidate cached /api/jobs
+        except Exception as e:
+            print(f"  GitLab: job map refresh failed: {e}")
+
+
+@app.on_event("startup")
+async def _start_gitlab_refresh():
+    """Start periodic GitLab job map refresh task."""
+    if GITLAB_CLIENT:
+        asyncio.create_task(_refresh_gitlab_job_map())
+
+
+IDEA_NAME_PATTERNS = [
+    re.compile(r'"Name"\s*:\s*"([^"]+)"'),
+    re.compile(r'\\"Name\\"\s*:\s*\\"([^"\\]+)\\"'),
+]
+
+
+# ---------------------------------------------------------------------------
+# ATIF trajectory generation
+# ---------------------------------------------------------------------------
+
+def find_agent_dir(job_dir: str) -> Optional[str]:
+    """Find the agent directory inside a job."""
+    if not os.path.isdir(job_dir):
+        return None
+    for entry in os.listdir(job_dir):
+        if entry.startswith("harbor-task"):
+            agent_dir = os.path.join(job_dir, entry, "agent")
+            if os.path.isdir(agent_dir):
+                return agent_dir
+    return None
+
+
+def generate_trajectory(job_dir: str) -> Optional[str]:
+    """Generate ATIF trajectory.json via the wrapper script. Returns path or None."""
+    agent_dir = find_agent_dir(job_dir)
+    if not agent_dir:
+        return None
+
+    traj_path = os.path.join(agent_dir, "trajectory.json")
+
+    # Skip if trajectory is fresh (< 60s old)
+    if os.path.exists(traj_path):
+        try:
+            age = time.time() - os.path.getmtime(traj_path)
+            if age < 60:
+                return traj_path
+        except OSError:
+            pass
+
+    if not os.path.isfile(HARBOR_PYTHON) or not os.path.isfile(GENERATE_ATIF_SCRIPT):
+        return traj_path if os.path.exists(traj_path) else None
+
+    try:
+        subprocess.run(
+            [HARBOR_PYTHON, GENERATE_ATIF_SCRIPT, "--job-dir", job_dir],
+            capture_output=True,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    return traj_path if os.path.exists(traj_path) else None
+
+
+# ---------------------------------------------------------------------------
+# Job discovery
+# ---------------------------------------------------------------------------
+
+def read_config(job_dir: str) -> dict:
+    """Read config.json from a job directory."""
+    cfg_path = os.path.join(job_dir, "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _extract_idea_stem(job_name: str) -> Optional[str]:
+    """Extract idea stem from '<stem>__YYYY-MM-DD__HH-MM-SS' naming."""
+    if not job_name:
+        return None
+    m = re.match(r"^(.+?)__\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}$", job_name)
+    if not m:
+        return None
+    stem = m.group(1).strip("_")
+    # Legacy names like '2026-02-21__20-39-12' should not map to idea_2026-02-21.json.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stem):
+        return None
+    return stem or None
+
+
+def _idea_path_candidates(stem: str) -> List[str]:
+    return [
+        os.path.join(REPO_ROOT, f"idea_{stem}.json"),
+        os.path.join(REPO_ROOT, "ideas", f"idea_{stem}.json"),
+        os.path.join(REPO_ROOT, f"{stem}.json"),
+        os.path.join(REPO_ROOT, "ideas", f"{stem}.json"),
+    ]
+
+
+def _iter_idea_files() -> List[str]:
+    base = Path(REPO_ROOT)
+    files = list(base.glob("idea_*.json")) + list((base / "ideas").glob("idea_*.json"))
+    return [str(p) for p in sorted(files)]
+
+
+def _extract_idea_name_from_text(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for pat in IDEA_NAME_PATTERNS:
+        m = pat.search(text)
+        if m:
+            name = (m.group(1) or "").strip()
+            if name:
+                return name
+    return None
+
+
+def _read_head(path: str, limit: int = 600_000) -> str:
+    try:
+        with open(path, "r", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return ""
+
+
+def _extract_idea_name_from_job_artifacts(job_dir: str) -> Optional[str]:
+    """Best-effort inference for legacy jobs lacking idea stem in job_id."""
+    if not job_dir or not os.path.isdir(job_dir):
+        return None
+
+    # Prefer command input snapshots if available (smaller and direct).
+    for entry in sorted(os.listdir(job_dir)):
+        if not entry.startswith("harbor-task"):
+            continue
+        cmd_root = Path(job_dir) / entry / "agent"
+        for cmd_txt in sorted(cmd_root.glob("command-*/command.txt")):
+            name = _extract_idea_name_from_text(_read_head(str(cmd_txt), limit=250_000))
+            if name:
+                return name
+
+    # Fallback to trajectory content.
+    traj_path = find_trajectory_path(job_dir)
+    if traj_path:
+        name = _extract_idea_name_from_text(_read_head(traj_path))
+        if name:
+            return name
+    return None
+
+
+def resolve_idea_file(job_id: str, config: dict, job_dir: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve idea JSON by job-name stem, then legacy artifact inference."""
+    stems: List[str] = []
+    for candidate in [job_id, str(config.get("job_name", ""))]:
+        stem = _extract_idea_stem(candidate)
+        if stem and stem not in stems:
+            stems.append(stem)
+
+    for stem in stems:
+        for path in _idea_path_candidates(stem):
+            if os.path.isfile(path):
+                return stem, path
+
+    inferred_name = _extract_idea_name_from_job_artifacts(job_dir or "")
+    if inferred_name:
+        for path in _idea_path_candidates(inferred_name):
+            if os.path.isfile(path):
+                return inferred_name, path
+
+        # Fallback: match by JSON `Name` field in idea files.
+        for path in _iter_idea_files():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if str(data.get("Name", "")).strip() == inferred_name:
+                    return inferred_name, path
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    return inferred_name or (stems[0] if stems else None), None
+
+
+def load_idea_payload(job_id: str, config: dict, job_dir: Optional[str] = None) -> dict:
+    """Load pretty JSON text for the job's original idea input."""
+    stem, path = resolve_idea_file(job_id, config, job_dir=job_dir)
+    if not stem or not path:
+        return {"found": False, "stem": stem, "source": None, "content": None, "format": None}
+
+    source = os.path.relpath(path, REPO_ROOT)
+    try:
+        with open(path) as f:
+            parsed = json.load(f)
+        text = json.dumps(parsed, indent=2)
+        return {
+            "found": True,
+            "stem": stem,
+            "source": source,
+            "content": mask_secrets_in_text(text),
+            "format": "json",
+        }
+    except (json.JSONDecodeError, OSError):
+        try:
+            with open(path, "r", errors="replace") as f:
+                text = f.read()
+            return {
+                "found": True,
+                "stem": stem,
+                "source": source,
+                "content": mask_secrets_in_text(text),
+                "format": "text",
+            }
+        except OSError:
+            return {"found": False, "stem": stem, "source": source, "content": None, "format": None}
+
+
+def _newest_mtime_in_dir(dirpath: str, max_depth: int = 2) -> float:
+    """Return the newest mtime of any file in a directory (shallow scan)."""
+    newest = 0.0
+    try:
+        for root, dirs, files in os.walk(dirpath):
+            # Limit depth to avoid scanning huge trees
+            depth = root[len(dirpath):].count(os.sep)
+            if depth >= max_depth:
+                dirs.clear()
+                continue
+            for fname in files:
+                try:
+                    mt = os.path.getmtime(os.path.join(root, fname))
+                    if mt > newest:
+                        newest = mt
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return newest
+
+
+def get_job_status(job_dir: str) -> str:
+    """Determine if a job is running, completed, or failed.
+
+    Detection strategy (works without Docker access):
+    1. If top-level result.json has finished_at → completed (Harbor writes this on exit)
+    2. If any file in agent/artifacts/ was modified < 6 min ago → running
+       (artifact sync writes every ~3 min, so 6 min = 2x safety margin)
+    3. If trajectory/activity file modified < 5 min ago → running
+    4. Otherwise → idle
+    """
+    # Check for top-level result.json first (definitive completion signal)
+    top_result = os.path.join(job_dir, "result.json")
+    if os.path.exists(top_result):
+        try:
+            with open(top_result) as f:
+                data = json.load(f)
+            if data.get("finished_at"):
+                return "completed"
+        except (OSError, ValueError):
+            pass
+
+    # Check artifact sync activity (most reliable running signal)
+    # Artifact sync writes every ~3 min; if anything updated < 6 min ago, still running
+    now = time.time()
+    for entry in os.listdir(job_dir):
+        if entry.startswith("harbor-task"):
+            artifacts_dir = os.path.join(job_dir, entry, "agent", "artifacts")
+            if os.path.isdir(artifacts_dir):
+                newest = _newest_mtime_in_dir(artifacts_dir)
+                if newest and (now - newest) < 360:  # 6 minutes
+                    return "running"
+
+    # Check trajectory/activity file mtime
+    activity_path = find_agent_activity_path(job_dir)
+    if activity_path:
+        try:
+            mtime = os.path.getmtime(activity_path)
+            if (now - mtime) < 300:  # 5 minutes
+                return "running"
+        except OSError:
+            pass
+
+    # No activity file at all
+    if not activity_path:
+        return "unknown"
+
+    # Fallback: check for result.json in verifier artifacts
+    for entry in os.listdir(job_dir):
+        if entry.startswith("harbor-task"):
+            result_path = os.path.join(job_dir, entry, "verifier", "artifacts", "result.json")
+            if os.path.exists(result_path):
+                return "completed"
+
+    return "idle"
+
+
+def get_submission_count(job_dir: str) -> int:
+    """Count submissions from version_log.json."""
+    best = 0
+    for root in iter_submission_roots(job_dir):
+        vlog = os.path.join(root, "version_log.json")
+        try:
+            with open(vlog) as f:
+                data = json.load(f)
+            count = data.get("current_version", len(data.get("versions", [])))
+            if isinstance(count, int):
+                best = max(best, count)
+        except (json.JSONDecodeError, OSError):
+            continue
+    if best:
+        return best
+    return 0
+
+
+def _parse_iso8601(ts: Optional[str]) -> Optional[datetime]:
+    """Parse ISO timestamp used in Harbor artifacts."""
+    if not ts or not isinstance(ts, str):
+        return None
+    normalized = ts.strip()
+    if not normalized:
+        return None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def get_job_duration_seconds(job_dir: str, status: str) -> Optional[int]:
+    """Best-effort wall-clock duration based on result timestamps."""
+    candidates = [os.path.join(job_dir, "result.json")]
+    try:
+        for entry in os.listdir(job_dir):
+            if entry.startswith("harbor-task"):
+                candidates.append(os.path.join(job_dir, entry, "verifier", "artifacts", "result.json"))
+    except OSError:
+        pass
+
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        started = _parse_iso8601(payload.get("started_at"))
+        finished = _parse_iso8601(payload.get("finished_at"))
+        if not started:
+            continue
+
+        if finished and finished >= started:
+            return int((finished - started).total_seconds())
+        if status == "running":
+            now = datetime.now(timezone.utc)
+            if now >= started:
+                return int((now - started).total_seconds())
+
+    return None
+
+
+def get_model_name(config: dict) -> str:
+    """Extract model name from config."""
+    agents = config.get("agents", [])
+    if agents:
+        model = agents[0].get("model_name", "")
+        # Shorten: "anthropic/claude-opus-4-6" → "opus-4-6"
+        if "/" in model:
+            model = model.split("/")[-1]
+        return model.replace("claude-", "")
+    return "unknown"
+
+
+def resolve_cost_model(config: dict, parsed_model: Optional[str]) -> str:
+    """Pick the most reliable model identifier for pricing."""
+    cfg_model = config.get("agents", [{}])[0].get("model_name")
+    return cfg_model or parsed_model or "claude-opus-4-6"
+
+
+def load_job_events(job_dir: str, after_line: int = 0, allow_backfill: bool = False) -> ParseResult:
+    """Load parsed events, preferring Harbor trajectory and backfilling if needed."""
+    result = detect_and_parse(job_dir, after_line=after_line)
+    if result.events or result.total_lines > 0 or not allow_backfill:
+        return result
+
+    # Fallback: if trajectory is missing or stale for a new job, try generating it once.
+    generate_trajectory(job_dir)
+    return detect_and_parse(job_dir, after_line=after_line)
+
+
+def _build_activity_cache_key(job_dir: str) -> Optional[tuple]:
+    """Stable cache key for a job's active transcript/trajectory."""
+    activity_path = find_agent_activity_path(job_dir)
+    if not activity_path:
+        return None
+    try:
+        st = os.stat(activity_path)
+        return (activity_path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def get_job_metrics(
+    job_dir: str,
+    config: dict,
+    allow_backfill: bool = True,
+    parsed: Optional[ParseResult] = None,
+) -> dict:
+    """Return cached per-job token/cost/breakdown metrics."""
+    cache_key = _build_activity_cache_key(job_dir)
+    cached = JOB_METRICS_CACHE.get(job_dir)
+    if cached and cached.get("cache_key") == cache_key:
+        return cached.get("data", {})
+
+    result = parsed or load_job_events(job_dir, allow_backfill=allow_backfill)
+    model_for_cost = resolve_cost_model(config, result.model)
+    data = {
+        "cost": estimate_cost(result.events, model=model_for_cost),
+        "cumulative_tokens": compute_cumulative_tokens(result.events),
+        "tool_breakdown": compute_tool_breakdown(result.events),
+        "event_type_breakdown": compute_event_type_breakdown(result.events),
+        "total_lines": result.total_lines,
+        "model": result.model,
+    }
+    JOB_METRICS_CACHE[job_dir] = {"cache_key": cache_key, "data": data}
+    return data
+
+
+def iter_submission_roots(job_dir: str) -> List[str]:
+    """Return all submissions roots found under verifier/agent artifacts."""
+    roots: List[str] = []
+    if not os.path.isdir(job_dir):
+        return roots
+
+    try:
+        for entry in os.listdir(job_dir):
+            if not entry.startswith("harbor-task"):
+                continue
+            for sub in ["verifier", "agent"]:
+                root = os.path.join(job_dir, entry, sub, "artifacts", "submissions")
+                vlog = os.path.join(root, "version_log.json")
+                if os.path.isdir(root) and os.path.exists(vlog):
+                    roots.append(root)
+    except OSError:
+        return roots
+    return roots
+
+
+def _split_review_rebuttal(md: str) -> Tuple[str, Optional[str]]:
+    """Extract review/rebuttal markdown sections from response.md."""
+    text = md or ""
+    if not text.strip():
+        return "", None
+
+    # Normalize line endings and split on headings if present.
+    normalized = text.replace("\r\n", "\n")
+    parts = re.split(r"(?im)^\s*##\s*Rebuttal\s*$", normalized, maxsplit=1)
+    review_part = parts[0]
+    review_part = re.sub(r"(?im)^\s*##\s*Review\s*$", "", review_part, count=1).strip()
+    rebuttal_part = parts[1].strip() if len(parts) > 1 else None
+    return review_part, rebuttal_part
+
+
+def _safe_submission_dir_name(name: str) -> bool:
+    if not name or "/" in name or "\\" in name:
+        return False
+    if name in {".", ".."} or ".." in name:
+        return False
+    return True
+
+
+def build_submission_records(job_dir: str, job_id: str) -> List[dict]:
+    """Collect submission versions across all artifacts roots."""
+    records: Dict[str, dict] = {}
+
+    for root in iter_submission_roots(job_dir):
+        vlog_path = os.path.join(root, "version_log.json")
+        try:
+            with open(vlog_path) as f:
+                vlog = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        for ver in vlog.get("versions", []):
+            directory = str(ver.get("directory", "")).strip()
+            if not _safe_submission_dir_name(directory):
+                continue
+            v_dir = os.path.join(root, directory)
+            review_md = ver.get("reviewer_preview", ver.get("reviewer_question_preview", "")) or ""
+            rebuttal_md = None
+
+            resp_md = os.path.join(v_dir, "reviewer_communications", "response.md")
+            resp_json = os.path.join(v_dir, "reviewer_communications", "response.json")
+
+            if os.path.exists(resp_md):
+                try:
+                    with open(resp_md) as f:
+                        review_md, rebuttal_md = _split_review_rebuttal(f.read())
+                except OSError:
+                    pass
+            elif os.path.exists(resp_json):
+                try:
+                    with open(resp_json) as f:
+                        resp = json.load(f)
+                    review_md = resp.get("question", review_md) or review_md
+                    rebuttal_md = resp.get("rebuttal")
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            has_pdf = os.path.exists(os.path.join(v_dir, "paper.pdf"))
+            has_tex = bool(ver.get("paper_tex", False) or os.path.exists(os.path.join(v_dir, "paper.tex")))
+            figures_count = 0
+            fig_dir = os.path.join(v_dir, "figures")
+            if os.path.isdir(fig_dir):
+                figures_count = len([f for f in os.listdir(fig_dir) if f.endswith(".png")])
+
+            record = {
+                "version": ver.get("version"),
+                "timestamp": ver.get("timestamp"),
+                "directory": directory,
+                "review": mask_secrets_in_text(review_md or ""),
+                "review_markdown": mask_secrets_in_text(review_md or ""),
+                "rebuttal": mask_secrets_in_text(rebuttal_md or "") if rebuttal_md else None,
+                "rebuttal_markdown": mask_secrets_in_text(rebuttal_md or "") if rebuttal_md else None,
+                "has_pdf": has_pdf,
+                "paper_url": f"/api/jobs/{job_id}/submissions/{directory}/paper" if has_pdf else None,
+                "has_tex": has_tex,
+                "has_experiments": bool(ver.get("has_experiments", False)),
+                "has_figures": bool(ver.get("has_figures", False) or figures_count > 0),
+                "figures_count": figures_count,
+                "reviewer_mode": ver.get("reviewer_mode", "api"),
+            }
+
+            prev = records.get(directory)
+            if not prev:
+                records[directory] = record
+            else:
+                prev_score = (
+                    (1 if prev.get("has_pdf") else 0)
+                    + len(prev.get("review_markdown", "") or "")
+                    + len(prev.get("rebuttal_markdown", "") or "")
+                )
+                new_score = (
+                    (1 if record.get("has_pdf") else 0)
+                    + len(record.get("review_markdown", "") or "")
+                    + len(record.get("rebuttal_markdown", "") or "")
+                )
+                if new_score >= prev_score:
+                    records[directory] = record
+
+    submissions = list(records.values())
+    # Show newest first where possible.
+    submissions.sort(
+        key=lambda r: (
+            r.get("version") if isinstance(r.get("version"), int) else -1,
+            r.get("timestamp") or "",
+        ),
+        reverse=True,
+    )
+    return submissions
+
+
+def _is_gitlab_backed(job_id: str) -> bool:
+    """Check if a job has pre-computed data on GitLab."""
+    return GITLAB_CLIENT is not None and job_id in GITLAB_JOB_MAP
+
+
+def _gitlab_lookup(job_id: str) -> Optional[Tuple[int, str]]:
+    """Return (project_id, branch) for a GitLab-backed job, or None.
+
+    In gitlab mode, this is the only data source.
+    In local mode, returns None (never use GitLab).
+    """
+    if SOURCE_MODE == "local":
+        return None
+    if not _is_gitlab_backed(job_id):
+        return None
+    return GITLAB_JOB_MAP.get(job_id)
+
+
+def _discover_jobs_gitlab() -> list:
+    """GitLab mode: all data from pre-computed GitLab metadata. Zero disk I/O."""
+    if not GITLAB_CLIENT:
+        return []
+    jobs = []
+    for job_id, (pid, branch) in GITLAB_JOB_MAP.items():
+        meta = GITLAB_CLIENT.get_metadata(pid, branch)
+        summary = GITLAB_CLIENT.get_trajectory_summary(pid, branch)
+        if not meta or not meta.get("job_id"):
+            continue
+        gl_model = meta.get("model", "unknown")
+        if "/" in gl_model:
+            gl_model = gl_model.split("/")[-1]
+        gl_model = gl_model.replace("claude-", "")
+        jobs.append({
+            "id": job_id,
+            "status": meta.get("status", "completed"),
+            "duration_seconds": meta.get("duration_seconds"),
+            "model": gl_model,
+            "line_count": summary.get("total_lines", 0) if summary else 0,
+            "file_size_mb": 0,
+            "submissions": meta.get("submission_count", 0),
+            "tokens": summary.get("cost") if summary else None,
+            "task_name": meta.get("idea_name", job_id).replace("_", " ").title(),
+        })
+    # Sort by start time descending (most recent first).
+    jobs.sort(key=lambda j: j.get("duration_seconds") or 0, reverse=False)
+    jobs.sort(key=lambda j: (GITLAB_CLIENT.get_metadata(
+        *GITLAB_JOB_MAP.get(j["id"], (0, ""))
+    ) or {}).get("started_at", ""), reverse=True)
+    return jobs
+
+
+def _discover_jobs_local() -> list:
+    """Local mode: scan jobs/ directory. No GitLab dependency."""
+    jobs = []
+    if not os.path.isdir(JOBS_DIR):
+        return jobs
+
+    job_entries = []
+    for name in os.listdir(JOBS_DIR):
+        job_dir = os.path.join(JOBS_DIR, name)
+        if not os.path.isdir(job_dir):
+            continue
+        try:
+            mtime = os.path.getmtime(job_dir)
+        except OSError:
+            mtime = 0
+        job_entries.append((name, job_dir, mtime))
+    job_entries.sort(key=lambda x: x[2], reverse=True)
+
+    for idx, (name, job_dir, _) in enumerate(job_entries):
+        config = read_config(job_dir)
+        status = get_job_status(job_dir)
+        duration_seconds = get_job_duration_seconds(job_dir, status)
+        activity_path = find_agent_activity_path(job_dir)
+
+        line_count = 0
+        file_size = 0
+        task_name = config.get("job_name", name)
+        token_summary = None
+        parsed_model = None
+        cache_key = _build_activity_cache_key(job_dir)
+
+        if cache_key:
+            file_size = cache_key[2]
+
+        cached = JOB_PARSE_CACHE.get(job_dir)
+        if cached and cached.get("cache_key") == cache_key:
+            line_count = cached.get("line_count", 0)
+            token_summary = cached.get("token_summary")
+            task_name = cached.get("task_name", task_name)
+            parsed_model = cached.get("parsed_model")
+        else:
+            # Try trajectory index first (fast, ~300KB per file) before full parse
+            traj_path = find_trajectory_path(job_dir)
+            if traj_path:
+                try:
+                    idx_data = get_or_generate_index(traj_path)
+                    if idx_data:
+                        line_count = idx_data.get("total_steps", 0)
+                        fm = idx_data.get("final_metrics") or {}
+                        agent_info = idx_data.get("agent") or {}
+                        parsed_model = agent_info.get("model_name")
+                        # Build token summary from index final_metrics
+                        total_prompt = fm.get("total_prompt_tokens") or 0
+                        total_comp = fm.get("total_completion_tokens") or 0
+                        total_cached = fm.get("total_cached_tokens") or 0
+                        extra = fm.get("extra") or {}
+                        cache_create = extra.get("total_cache_creation_input_tokens") or 0
+                        if total_prompt or total_comp:
+                            token_summary = estimate_cost(
+                                total_prompt, total_comp, total_cached, cache_create,
+                                model=(parsed_model or "unknown"),
+                            )
+                except Exception:
+                    pass  # Fall back to no tokens
+            elif status == "running":
+                result = load_job_events(job_dir)
+                if result.events:
+                    metrics = get_job_metrics(job_dir, config, allow_backfill=False, parsed=result)
+                    token_summary = metrics.get("cost")
+                    line_count = result.total_lines or line_count
+                    parsed_model = result.model
+                    for ev in result.events[:10]:
+                        if ev.source in {"agent", "user"} and ev.event_type in {"text", "user_message"} and len(ev.summary) > 20:
+                            task_name = ev.summary[:80]
+                            break
+
+            if activity_path and not line_count and not activity_path.endswith("trajectory.json"):
+                try:
+                    line_count = max(1, os.path.getsize(activity_path) // 500)
+                except OSError:
+                    pass
+
+            JOB_PARSE_CACHE[job_dir] = {
+                "cache_key": cache_key,
+                "line_count": line_count,
+                "token_summary": token_summary,
+                "task_name": task_name,
+                "parsed_model": parsed_model,
+            }
+
+        model_name = get_model_name(config)
+        if model_name == "unknown" and parsed_model:
+            model_name = str(parsed_model).split("/")[-1].replace("claude-", "")
+
+        sub_count = get_submission_count(job_dir)
+
+        # Hide short-lived completed/idle jobs (smoke tests, crashed runs).
+        # Running jobs are always shown regardless of duration.
+        MIN_DURATION_DISPLAY_SEC = 2400  # 40 minutes
+        if status not in ("running",) and duration_seconds is not None and duration_seconds < MIN_DURATION_DISPLAY_SEC:
+            continue
+
+        jobs.append({
+            "id": name,
+            "dir": job_dir,
+            "status": status,
+            "duration_seconds": duration_seconds,
+            "model": model_name,
+            "line_count": line_count,
+            "file_size_mb": round(file_size / 1_000_000, 1),
+            "submissions": sub_count,
+            "tokens": token_summary,
+            "task_name": mask_secrets_in_text(task_name),
+        })
+
+    return jobs
+
+
+def discover_jobs() -> list:
+    """Return job list from the configured source (gitlab or local)."""
+    if SOURCE_MODE == "gitlab":
+        return _discover_jobs_gitlab()
+    return _discover_jobs_local()
+
+
+def discover_job_meta(job_id: str) -> Optional[dict]:
+    """Load lightweight metadata for a single job detail page."""
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return None
+
+    config = read_config(job_dir)
+    status = get_job_status(job_dir)
+    duration_seconds = get_job_duration_seconds(job_dir, status)
+    submissions = get_submission_count(job_dir)
+    model_name = get_model_name(config)
+
+    if model_name == "unknown":
+        metrics = get_job_metrics(job_dir, config, allow_backfill=True)
+        parsed_model = metrics.get("model")
+        if parsed_model:
+            model_name = str(parsed_model).split("/")[-1].replace("claude-", "")
+
+    return {
+        "id": job_id,
+        "status": status,
+        "duration_seconds": duration_seconds,
+        "model": model_name,
+        "submissions": submissions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SPA frontend (React build) — served as static files
+# ---------------------------------------------------------------------------
+
+FRONTEND_BUILD_DIR = os.path.join(os.path.dirname(__file__), "frontend", "build", "client")
+
+# Mount static assets if the build exists
+from fastapi.staticfiles import StaticFiles as _StaticFiles
+if os.path.isdir(os.path.join(FRONTEND_BUILD_DIR, "assets")):
+    app.mount("/assets", _StaticFiles(directory=os.path.join(FRONTEND_BUILD_DIR, "assets")), name="frontend_assets")
+if os.path.isdir(os.path.join(FRONTEND_BUILD_DIR, "fonts")):
+    app.mount("/fonts", _StaticFiles(directory=os.path.join(FRONTEND_BUILD_DIR, "fonts")), name="frontend_fonts")
+
+
+# ---------------------------------------------------------------------------
+# API endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/jobs")
+async def api_jobs():
+    """Return JSON list of all jobs with summary stats."""
+    now = time.time()
+    cached = JOBS_LIST_CACHE
+    if (
+        cached.get("jobs_dir") == JOBS_DIR
+        and cached.get("payload") is not None
+        and now < float(cached.get("expires_at", 0.0))
+    ):
+        return JSONResponse(mask_secrets(cached["payload"]))
+
+    payload = discover_jobs()
+    JOBS_LIST_CACHE.update({
+        "jobs_dir": JOBS_DIR,
+        "payload": payload,
+        "expires_at": now + JOBS_LIST_CACHE_TTL_SEC,
+    })
+    return JSONResponse(mask_secrets(payload))
+
+
+@app.get("/api/jobs/{job_id}/meta")
+async def api_job_meta(job_id: str):
+    """Return lightweight metadata for one job."""
+    # Try GitLab first.
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        gl_meta = GITLAB_CLIENT.get_metadata(project_id, branch)
+        if gl_meta:
+            model = gl_meta.get("model", "unknown")
+            if "/" in model:
+                model = model.split("/")[-1]
+            model = model.replace("claude-", "")
+            # Build GitLab web URL for this branch.
+            gitlab_url = None
+            for repo in (GITLAB_CLIENT.list_repos() or []):
+                if repo["id"] == project_id:
+                    gitlab_url = f"{repo['web_url']}/-/tree/{branch}"
+                    break
+            return JSONResponse({
+                "id": job_id,
+                "status": gl_meta.get("status", "completed"),
+                "duration_seconds": gl_meta.get("duration_seconds"),
+                "model": model,
+                "submissions": gl_meta.get("submission_count", 0),
+                "gitlab_url": gitlab_url,
+            }, headers=_CDN_CACHE_1H)
+
+    # Fallback to local disk.
+    meta = discover_job_meta(job_id)
+    if not meta:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    # Still try to provide a GitLab link if the job is mapped.
+    if _is_gitlab_backed(job_id) and GITLAB_CLIENT:
+        project_id, branch = GITLAB_JOB_MAP[job_id]
+        for repo in (GITLAB_CLIENT.list_repos() or []):
+            if repo["id"] == project_id:
+                meta["gitlab_url"] = f"{repo['web_url']}/-/tree/{branch}"
+                break
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    return JSONResponse(mask_secrets(meta), headers=_cache_headers_for_job(job_dir))
+
+
+# Server-side cache for parsed events (keyed by job_id:after_line).
+# Completed jobs never change, so cache indefinitely in-process.
+_EVENTS_CACHE: Dict[str, dict] = {}
+
+# Server-side cache for trajectory indices (keyed by job_id).
+# Stores {"data": <index_dict>, "traj_path": str, "mtime": float}.
+_INDEX_CACHE: Dict[str, dict] = {}
+
+# Cache headers for immutable completed-job data.
+# CDN-Cache-Control tells Cloudflare to cache JSON (not in its default cacheable list).
+_CDN_CACHE_24H = {
+    "Cache-Control": "public, max-age=86400",
+    "CDN-Cache-Control": "public, max-age=86400",
+}
+_CDN_CACHE_1H = {
+    "Cache-Control": "public, max-age=3600",
+    "CDN-Cache-Control": "public, max-age=3600",
+}
+
+
+def _cache_headers_for_job(job_dir: str) -> dict:
+    """Return CDN cache headers if the job is completed (immutable data)."""
+    if get_job_status(job_dir) == "completed":
+        return _CDN_CACHE_24H
+    return {}
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def api_events(job_id: str, after: int = 0):
+    """Return JSON events, optionally starting from line N."""
+    cache_key = f"{job_id}:{after}"
+    cached = _EVENTS_CACHE.get(cache_key)
+    if cached is not None:
+        # Completed jobs never change — long cache for CF edge + browser.
+        return JSONResponse(cached, headers=_CDN_CACHE_24H)
+
+    # In gitlab mode, parse the sanitized trajectory from GitLab.
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        traj = GITLAB_CLIENT.get_file_json(project_id, branch, "agent_trace/trajectory.json")
+        if traj:
+            from parse_trajectory import parse_atif_trajectory
+            import tempfile
+            # Write to temp file for the parser (it expects a file path).
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+                json.dump(traj, tmp)
+                tmp_path = tmp.name
+            try:
+                result = parse_atif_trajectory(tmp_path, after_line=after)
+            finally:
+                os.unlink(tmp_path)
+            payload = {
+                "events": [e.to_dict() for e in result.events],
+                "total_lines": result.total_lines,
+                "session_id": result.session_id,
+                "model": result.model,
+            }
+            _EVENTS_CACHE[cache_key] = payload
+            return JSONResponse(payload, headers=_CDN_CACHE_24H)
+
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "Job not found on GitLab"}, status_code=404)
+
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    result = load_job_events(job_dir, after_line=after, allow_backfill=True)
+    return JSONResponse({
+        "events": mask_secrets([e.to_dict() for e in result.events]),
+        "total_lines": result.total_lines,
+        "session_id": result.session_id,
+        "model": result.model,
+    }, headers=_cache_headers_for_job(job_dir))
+
+
+@app.get("/api/jobs/{job_id}/stream")
+async def stream_events(job_id: str, after: int = 0):
+    """SSE stream: polls parsed trajectory/events every 2 seconds, yields new events."""
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "SSE streaming not available in gitlab mode"}, status_code=404)
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    activity_path = find_agent_activity_path(job_dir)
+    if not activity_path:
+        generate_trajectory(job_dir)
+        activity_path = find_agent_activity_path(job_dir)
+    if not activity_path:
+        return JSONResponse({"error": "No trajectory or transcript found"}, status_code=404)
+
+    async def event_generator():
+        last_line = after
+        config = read_config(job_dir)
+        tick = 0
+
+        while True:
+            result = load_job_events(job_dir, after_line=last_line, allow_backfill=True)
+            for event in result.events:
+                yield {
+                    "event": "new_event",
+                    "data": json.dumps(mask_secrets(event.to_dict())),
+                }
+            if result.events:
+                last_line = result.total_lines
+
+            # Full metrics are expensive on large trajectories; refresh less frequently.
+            if tick == 0 or result.events or tick % 3 == 0:
+                metrics = get_job_metrics(job_dir, config, allow_backfill=True)
+                cumulative = metrics.get("cumulative_tokens") or []
+                yield {
+                    "event": "metrics",
+                    "data": json.dumps(mask_secrets({
+                        "cost": metrics.get("cost"),
+                        "cumulative_tokens": cumulative[-5:] if cumulative else [],  # last 5 for chart update
+                        "tool_breakdown": metrics.get("tool_breakdown") or [],
+                        "event_type_breakdown": metrics.get("event_type_breakdown") or [],
+                        "total_lines": metrics.get("total_lines", result.total_lines),
+                    })),
+                }
+
+            # Regenerate ATIF trajectory every ~60s for running jobs
+            tick += 1
+            if tick % 30 == 0:
+                generate_trajectory(job_dir)
+
+            await asyncio.sleep(2)
+
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/api/jobs/{job_id}/tokens")
+async def api_tokens(job_id: str):
+    """Token usage summary and per-step breakdown."""
+    # Try GitLab first for completed jobs (pre-computed, instant).
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        summary = GITLAB_CLIENT.get_trajectory_summary(project_id, branch)
+        if summary:
+            return JSONResponse({
+                "cost": summary.get("cost"),
+                "cumulative_tokens": summary.get("cumulative_tokens") or [],
+                "tool_breakdown": summary.get("tool_breakdown") or [],
+                "event_type_breakdown": summary.get("event_type_breakdown") or [],
+            }, headers=_CDN_CACHE_24H)
+
+    # Fallback to local disk (local mode only).
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "Job not found on GitLab"}, status_code=404)
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    config = read_config(job_dir)
+    metrics = get_job_metrics(job_dir, config, allow_backfill=True)
+
+    return JSONResponse(mask_secrets({
+        "cost": metrics.get("cost"),
+        "cumulative_tokens": metrics.get("cumulative_tokens") or [],
+        "tool_breakdown": metrics.get("tool_breakdown") or [],
+        "event_type_breakdown": metrics.get("event_type_breakdown") or [],
+    }), headers=_cache_headers_for_job(job_dir))
+
+
+@app.get("/api/jobs/{job_id}/idea")
+async def api_job_idea(job_id: str):
+    """Return original idea JSON matched by job stem."""
+    # Try GitLab first: idea.json is pushed alongside other artifacts.
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        idea_data = GITLAB_CLIENT.get_file_json(project_id, branch, "idea.json")
+        if idea_data:
+            stem = _extract_idea_stem(job_id)
+            text = json.dumps(idea_data, indent=2)
+            return JSONResponse({
+                "found": True,
+                "stem": stem,
+                "source": "gitlab",
+                "content": mask_secrets_in_text(text),
+                "format": "json",
+            }, headers=_CDN_CACHE_24H)
+        # No idea.json on GitLab — return not-found.
+        return JSONResponse({"found": False, "stem": _extract_idea_stem(job_id), "source": None, "content": None, "format": None})
+
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"found": False, "stem": None, "source": None, "content": None, "format": None})
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    config = read_config(job_dir)
+    return JSONResponse(load_idea_payload(job_id, config, job_dir=job_dir),
+                        headers=_cache_headers_for_job(job_dir))
+
+
+@app.get("/api/jobs/{job_id}/submissions")
+async def api_submissions(job_id: str):
+    """Read submission versions with markdown review/rebuttal and paper links."""
+    # Try GitLab for completed jobs (version_log + response.md per version).
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        vlog = GITLAB_CLIENT.get_file_json(project_id, branch, "reviewer_trace/version_log.json")
+        if vlog and vlog.get("versions"):
+            versions = vlog["versions"]
+
+            # Fetch all response.md files in parallel to avoid N sequential API calls.
+            from concurrent.futures import ThreadPoolExecutor
+            def _fetch_response(vdir):
+                if not vdir:
+                    return None
+                data = GITLAB_CLIENT.get_file_raw(project_id, branch, f"reviewer_trace/{vdir}/response.md")
+                return data.decode("utf-8", errors="replace") if data else None
+
+            with ThreadPoolExecutor(max_workers=min(8, len(versions))) as pool:
+                resp_texts = list(pool.map(_fetch_response, [v.get("directory", "") for v in versions]))
+
+            submissions = []
+            for v, resp_text in zip(versions, resp_texts):
+                vdir = v.get("directory", "")
+                review_md = ""
+                rebuttal_md = None
+                if resp_text:
+                    review_md, rebuttal_md = _split_review_rebuttal(resp_text)
+                submissions.append({
+                    "version": v.get("version"),
+                    "timestamp": v.get("timestamp"),
+                    "directory": vdir,
+                    "reviewer_mode": v.get("reviewer_mode"),
+                    "review_markdown": review_md,
+                    "rebuttal_markdown": rebuttal_md,
+                    "paper_url": f"/api/jobs/{job_id}/submissions/{vdir}/paper" if vdir else None,
+                })
+            submissions.sort(key=lambda r: (r.get("version") or -1, r.get("timestamp") or ""), reverse=True)
+            return JSONResponse({"submissions": submissions, "total": len(submissions)},
+                                headers=_CDN_CACHE_24H)
+
+    # Fallback to local disk (local mode only).
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"submissions": [], "total": 0})
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    submissions = build_submission_records(job_dir, job_id)
+    return JSONResponse({"submissions": submissions, "total": len(submissions)},
+                        headers=_cache_headers_for_job(job_dir))
+
+
+@app.get("/api/jobs/{job_id}/submissions/{submission_dir}/paper")
+async def api_submission_pdf(job_id: str, submission_dir: str):
+    """Serve paper.pdf for a specific submission version directory."""
+    if not _safe_submission_dir_name(submission_dir):
+        return JSONResponse({"error": "Invalid submission directory"}, status_code=400)
+
+    # Try GitLab for the main paper.pdf (pushed as paper.pdf at repo root).
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        pdf_bytes = GITLAB_CLIENT.get_file_raw(project_id, branch, "paper.pdf")
+        if pdf_bytes:
+            from starlette.responses import Response
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": "inline; filename=paper.pdf",
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
+    # Fallback to local disk (local mode only).
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "PDF not found on GitLab"}, status_code=404)
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    for root in iter_submission_roots(job_dir):
+        pdf_path = os.path.join(root, submission_dir, "paper.pdf")
+        if os.path.exists(pdf_path):
+            return FileResponse(
+                pdf_path,
+                media_type="application/pdf",
+                filename="paper.pdf",
+                content_disposition_type="inline",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+    return JSONResponse({"error": "PDF not found"}, status_code=404)
+
+
+@app.get("/api/jobs/{job_id}/artifacts")
+async def api_artifacts(job_id: str):
+    """List figures, papers, and other artifacts."""
+    # Try GitLab for completed jobs.
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        gl_meta = GITLAB_CLIENT.get_metadata(project_id, branch)
+        if gl_meta:
+            figures = gl_meta.get("figures", [])
+            papers = ["paper.pdf"] if gl_meta.get("has_paper_pdf") else []
+            return JSONResponse({"figures": figures, "papers": papers})
+
+    # Fallback to local disk (local mode only).
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"figures": [], "papers": []})
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    arts_dir = find_artifacts_dir(job_dir)
+    if not arts_dir:
+        return JSONResponse({"figures": [], "papers": []})
+
+    figures = []
+    fig_dir = os.path.join(arts_dir, "figures")
+    if os.path.isdir(fig_dir):
+        figures = sorted(os.listdir(fig_dir))
+
+    papers = []
+    latex_dir = os.path.join(arts_dir, "latex")
+    if os.path.isdir(latex_dir):
+        papers = [f for f in os.listdir(latex_dir) if f.endswith((".tex", ".pdf"))]
+
+    return JSONResponse(mask_secrets({"figures": figures, "papers": papers}),
+                        headers=_cache_headers_for_job(job_dir))
+
+
+@app.get("/api/jobs/{job_id}/trajectory")
+async def api_trajectory(job_id: str, regenerate: bool = False):
+    """Return ATIF trajectory JSON, generating it if needed."""
+    # Try GitLab for completed jobs (sanitized trajectory in agent_trace/).
+    gl = _gitlab_lookup(job_id)
+    if gl and not regenerate:
+        project_id, branch = gl
+        traj = GITLAB_CLIENT.get_file_json(project_id, branch, "agent_trace/trajectory.json")
+        if traj:
+            return JSONResponse(traj, headers=_CDN_CACHE_24H)
+
+    # Fallback to local disk (local mode only).
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "Trajectory not found on GitLab"}, status_code=404)
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+
+    traj_path = find_trajectory_path(job_dir)
+    if not traj_path:
+        agent_dir = find_agent_dir(job_dir)
+        if not agent_dir:
+            return JSONResponse({"error": "No agent directory"}, status_code=404)
+        traj_path = os.path.join(agent_dir, "trajectory.json")
+
+    # Generate if missing, stale, or forced
+    need_gen = regenerate or not os.path.exists(traj_path)
+    if not need_gen and os.path.exists(traj_path):
+        try:
+            age = time.time() - os.path.getmtime(traj_path)
+            status = get_job_status(job_dir)
+            if status == "running" and age > 60:
+                need_gen = True
+        except OSError:
+            need_gen = True
+
+    if need_gen:
+        generate_trajectory(job_dir)
+        traj_path = find_trajectory_path(job_dir) or traj_path
+
+    if not os.path.exists(traj_path):
+        return JSONResponse({"error": "No trajectory available"}, status_code=404)
+
+    try:
+        with open(traj_path) as f:
+            data = json.load(f)
+        return JSONResponse(mask_secrets(data), headers=_cache_headers_for_job(job_dir))
+    except (json.JSONDecodeError, OSError) as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _resolve_trajectory_path(job_id: str) -> Optional[str]:
+    """Resolve trajectory file path for a local job, generating if needed."""
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        return None
+    traj_path = find_trajectory_path(job_dir)
+    if not traj_path:
+        generate_trajectory(job_dir)
+        traj_path = find_trajectory_path(job_dir)
+    return traj_path
+
+
+def _get_cached_index(job_id: str, traj_path: str) -> Optional[dict]:
+    """Return index from in-memory cache if still valid."""
+    cached = _INDEX_CACHE.get(job_id)
+    if not cached:
+        return None
+    if cached.get("traj_path") != traj_path:
+        return None
+    try:
+        mtime = os.path.getmtime(traj_path)
+        if cached.get("mtime") == mtime:
+            return cached["data"]
+    except OSError:
+        pass
+    return None
+
+
+def _cache_index(job_id: str, traj_path: str, index: dict) -> None:
+    """Store index in the in-memory cache."""
+    try:
+        mtime = os.path.getmtime(traj_path)
+    except OSError:
+        mtime = 0.0
+    _INDEX_CACHE[job_id] = {
+        "data": index,
+        "traj_path": traj_path,
+        "mtime": mtime,
+    }
+
+
+@app.get("/api/jobs/{job_id}/trajectory/index")
+async def api_trajectory_index(job_id: str):
+    """Return lightweight trajectory index for virtual scrolling.
+
+    The index contains step summaries with byte offsets for O(1) random access
+    to any step.  It is cached on disk as trajectory_index.json and in-memory.
+    """
+    # --- GitLab mode: build index from the remote trajectory ---
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        # Check in-memory cache first (keyed by job_id).
+        cached = _INDEX_CACHE.get(job_id)
+        if cached and cached.get("data"):
+            return JSONResponse(cached["data"], headers=_CDN_CACHE_24H)
+
+        project_id, branch = gl
+        traj = GITLAB_CLIENT.get_file_json(project_id, branch, "agent_trace/trajectory.json")
+        if not traj:
+            return JSONResponse({"error": "Trajectory not found on GitLab"}, status_code=404)
+
+        # Write to a temp file so generate_index() can compute byte offsets.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+            json.dump(traj, tmp)
+            tmp_path = tmp.name
+        try:
+            index = generate_index(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+        # Cache in-memory (GitLab data doesn't change for completed jobs).
+        _INDEX_CACHE[job_id] = {"data": index, "traj_path": "gitlab", "mtime": 0}
+        return JSONResponse(index, headers=_CDN_CACHE_24H)
+
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "Job not found on GitLab"}, status_code=404)
+
+    # --- Local mode ---
+    traj_path = _resolve_trajectory_path(job_id)
+    if not traj_path or not os.path.exists(traj_path):
+        return JSONResponse({"error": "No trajectory available"}, status_code=404)
+
+    # Check in-memory cache.
+    index = _get_cached_index(job_id, traj_path)
+    if index is not None:
+        return JSONResponse(index)
+
+    # Check on-disk cache, then generate.
+    index = get_or_generate_index(traj_path)
+
+    # Sanitize summaries.
+    for step in index.get("steps", []):
+        if step.get("summary"):
+            step["summary"] = mask_secrets_in_text(step["summary"])
+
+    # Determine cache headers: completed jobs get long TTL.
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    status = get_job_status(job_dir)
+    headers = _CDN_CACHE_24H if status != "running" else {}
+
+    _cache_index(job_id, traj_path, index)
+    return JSONResponse(index, headers=headers)
+
+
+@app.get("/api/jobs/{job_id}/trajectory/step/{step_id}")
+async def api_trajectory_step(job_id: str, step_id: int):
+    """Return full content for a single ATIF step via byte-offset seeking.
+
+    Uses the trajectory index to locate the step in the file, then reads only
+    the relevant bytes.  Falls back to loading from JSON if byte offsets are
+    unavailable.
+    """
+    # --- GitLab mode: fetch full trajectory and extract step ---
+    gl = _gitlab_lookup(job_id)
+    if gl:
+        project_id, branch = gl
+        traj = GITLAB_CLIENT.get_file_json(project_id, branch, "agent_trace/trajectory.json")
+        if not traj:
+            return JSONResponse({"error": "Trajectory not found on GitLab"}, status_code=404)
+        steps = traj.get("steps", [])
+        if step_id < 0 or step_id >= len(steps):
+            return JSONResponse({"error": f"Step {step_id} out of range (0..{len(steps)-1})"}, status_code=404)
+        return JSONResponse(mask_secrets(steps[step_id]), headers=_CDN_CACHE_24H)
+
+    if SOURCE_MODE == "gitlab":
+        return JSONResponse({"error": "Job not found on GitLab"}, status_code=404)
+
+    # --- Local mode ---
+    traj_path = _resolve_trajectory_path(job_id)
+    if not traj_path or not os.path.exists(traj_path):
+        return JSONResponse({"error": "No trajectory available"}, status_code=404)
+
+    # Get the index (from cache or generate).
+    index = _get_cached_index(job_id, traj_path)
+    if index is None:
+        index = get_or_generate_index(traj_path)
+        _cache_index(job_id, traj_path, index)
+
+    steps_index = index.get("steps", [])
+    if step_id < 0 or step_id >= len(steps_index):
+        total = index.get("total_steps", 0)
+        return JSONResponse(
+            {"error": f"Step {step_id} out of range (0..{total - 1})"},
+            status_code=404,
+        )
+
+    step_info = steps_index[step_id]
+    byte_offset = step_info.get("byte_offset", 0)
+    byte_length = step_info.get("byte_length", 0)
+
+    # Try O(1) byte-offset read.
+    step_data = read_single_step(traj_path, byte_offset, byte_length)
+    if step_data is not None:
+        return JSONResponse(mask_secrets(step_data), headers=_CDN_CACHE_24H)
+
+    # Fallback: load the full file and index into steps array.
+    try:
+        with open(traj_path, "r") as f:
+            data = json.load(f)
+        steps = data.get("steps", [])
+        if step_id < len(steps):
+            return JSONResponse(mask_secrets(steps[step_id]), headers=_CDN_CACHE_24H)
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    return JSONResponse({"error": "Failed to read step data"}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# SPA catch-all: serve index.html for any non-API, non-asset path
+# ---------------------------------------------------------------------------
+
+@app.get("/favicon.ico")
+async def favicon():
+    fav = os.path.join(FRONTEND_BUILD_DIR, "favicon.ico")
+    if os.path.exists(fav):
+        return FileResponse(fav)
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+@app.get("/{path:path}")
+async def serve_spa(path: str):
+    """Serve the React SPA for all non-API routes."""
+    index_html = os.path.join(FRONTEND_BUILD_DIR, "index.html")
+    if os.path.exists(index_html):
+        return FileResponse(index_html, media_type="text/html")
+    # Fallback: if no React build, try old templates
+    template_path = os.path.join(TEMPLATES_DIR, "index.html")
+    if os.path.exists(template_path):
+        with open(template_path) as f:
+            return HTMLResponse(f.read())
+    return HTMLResponse("<h1>Viewer not built. Run: cd viewer/frontend && npx react-router build</h1>")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _init_gitlab_client():
+    """Initialize GitLab client if GITLAB_KEY is set.
+
+    Pre-warms all caches so the first page load is fast.
+    """
+    global GITLAB_CLIENT
+    token = os.environ.get("GITLAB_KEY", "")
+    if not token:
+        return
+    try:
+        client = GitLabClient(token)
+        if client.username:
+            GITLAB_CLIENT = client
+            print(f"  GitLab: connected as {client.username}")
+            # Pre-populate job map from GitLab repos.
+            try:
+                gl_jobs = client.discover_gitlab_jobs()
+                for gj in gl_jobs:
+                    if gj.get("_project_id") and gj.get("_branch"):
+                        GITLAB_JOB_MAP[gj["id"]] = (gj["_project_id"], gj["_branch"])
+                print(f"  GitLab: {len(GITLAB_JOB_MAP)} jobs indexed")
+            except Exception as e:
+                print(f"  GitLab: job discovery failed: {e}")
+
+            # Pre-warm trajectory summary cache in parallel so first page
+            # load doesn't block on N sequential GitLab API calls.
+            if GITLAB_JOB_MAP:
+                from concurrent.futures import ThreadPoolExecutor
+                def _warm(item):
+                    pid, branch = item
+                    client.get_trajectory_summary(pid, branch)
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    pool.map(_warm, GITLAB_JOB_MAP.values())
+                print(f"  GitLab: caches pre-warmed")
+    except Exception as e:
+        print(f"  GitLab: init failed: {e}")
+
+
+def main():
+    global JOBS_DIR, SOURCE_MODE
+    parser = argparse.ArgumentParser(description="AI Scientist v3 — Job Viewer")
+    parser.add_argument("--jobs-dir", default="./jobs", help="Path to jobs directory (local mode)")
+    parser.add_argument("--source", choices=["local", "gitlab"], default=None,
+                        help="Data source: 'local' (disk only) or 'gitlab' (GitLab API only). "
+                             "Default: auto-detect (gitlab if GITLAB_KEY is set, else local)")
+    parser.add_argument("--port", type=int, default=8501, help="Port to serve on")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    args = parser.parse_args()
+
+    JOBS_DIR = os.path.abspath(args.jobs_dir)
+
+    # Determine source mode.
+    if args.source:
+        SOURCE_MODE = args.source
+    elif os.environ.get("GITLAB_KEY"):
+        SOURCE_MODE = "gitlab"
+    else:
+        SOURCE_MODE = "local"
+
+    print(f"AI Scientist v3 — Job Viewer")
+    print(f"  Source: {SOURCE_MODE}")
+
+    if SOURCE_MODE == "gitlab":
+        _init_gitlab_client()
+        if not GITLAB_CLIENT:
+            print("  ERROR: gitlab mode requires GITLAB_KEY env var")
+            sys.exit(1)
+    else:
+        print(f"  Jobs dir: {JOBS_DIR}")
+
+    print(f"  Serving on http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

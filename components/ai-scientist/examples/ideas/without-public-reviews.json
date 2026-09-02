@@ -1,0 +1,13 @@
+{
+  "Name": "improve_example_without_reviews",
+  "Title": "Improve an Existing Paper Without Public Reviews",
+  "Short Hypothesis": "A missing robustness evaluation is the paper's most important addressable weakness.",
+  "Task": "Read /app/inputs/paper.tex and inspect /app/inputs/code. Reproduce the paper's main result. Use the Search API to assess novelty and identify missing baselines. Run at least one evidence-backed improvement experiment, write and compile a revised paper, submit it to the configured AI Reviewer, address the feedback, and resubmit. All reported numbers must come from executed code.",
+  "Paper": {
+    "local_path": "/app/inputs/paper.tex",
+    "code_path": "/app/inputs/code"
+  },
+  "Human_Reviews_From_OpenReview": false,
+  "What_NOT_To_Do": "Do not invent reviewer feedback or experimental results. Do not replace the method without first reproducing the original baseline.",
+  "GPU_Needed": false
+}

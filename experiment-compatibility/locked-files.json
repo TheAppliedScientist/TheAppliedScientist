@@ -1,0 +1,17 @@
+{
+  "source_repository": "https://github.com/koookieee/ai-scientist-v3_shenghzi",
+  "source_commit": "cd0a821d9826b4d8b2e2466a571aae910606f97f",
+  "profile": "reference",
+  "locked_files": {
+    "components/ai-reviewer/prompts/paper_reviewer_instruction_template.md": "a1705613940c21388cc1b05ca163ea5ec3cd04284dcdd5074351f76a26b81b68",
+    "components/ai-scientist/.claude/CLAUDE.md": "80b341ebe7d425d852e27ea5b6c7ae1c9368ba3ba333c3217741d37e17548bbd",
+    "components/ai-scientist/harbor-task/instruction.md.template": "74284644228a9198306d52a0805e2ce61d966dc7404256c47a219f5f3cd2ebc2",
+    "components/ai-scientist/scripts/submit_for_review.sh": "94ac46ea0f1eae2fb368f6fc462bd8600cb4bfec14d98598af47fa13488af7ab"
+  },
+  "runtime_pins": {
+    "reviewer_harbor": "0.7.0",
+    "reviewer_claude_code": "2.1.101",
+    "scientist_harbor_commit": "7ed1ffc1bddf83f1bd1bce52fd366ec4a32f8380",
+    "scientist_claude_code": "2.1.145"
+  }
+}

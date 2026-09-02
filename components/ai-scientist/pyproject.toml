@@ -1,0 +1,36 @@
+[project]
+name = "ai-scientist-v3"
+version = "0.1.0"
+description = "Autonomous AI research agent"
+requires-python = ">=3.12"
+dependencies = [
+    # Viewer
+    "fastapi",
+    "uvicorn",
+    "sse-starlette",
+    "ijson",
+    # Pinned to harbor 0.1.45 — newer harbor (0.7.x+) hangs in claude-code's
+    # stream-json reader: harbor's async client never drains the response and
+    # the run wedges on a CLOSE-WAIT socket inside ep_poll. 0.1.45 is the last
+    # version verified end-to-end with local Docker and claude-code 2.1.145.
+    "harbor @ git+https://github.com/harbor-framework/harbor.git@7ed1ffc1bddf83f1bd1bce52fd366ec4a32f8380",
+    "claude-agent-sdk==0.1.44",
+    # GitLab integration
+    "python-gitlab",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# This repo's top level holds runtime templates (ideas/, paper_template/, viewer/, ...)
+# alongside a single Python package (local_harbor_agents/). Setuptools' auto-discovery
+# can't tell them apart and bails. Explicitly list what to install as Python packages.
+[tool.setuptools]
+packages = ["local_harbor_agents"]

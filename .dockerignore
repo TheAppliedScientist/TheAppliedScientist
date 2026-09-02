@@ -1,0 +1,13 @@
+.git
+.env
+.runtime
+.venvs
+**/__pycache__
+**/*.pyc
+data
+jobs
+results
+trials
+components/ai-scientist/jobs
+components/ai-scientist/data
+

@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Dependency-free installer and operator for TheAppliedScientist."""
+
+from __future__ import annotations
+import argparse, getpass, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.error, urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+ENV_FILE, ENV_EXAMPLE = ROOT / ".env", ROOT / ".env.example"
+RUNTIME, VENVS = ROOT / ".runtime", ROOT / ".venvs"
+SEARCH = ROOT / "components/search-api"
+REVIEWER = ROOT / "components/ai-reviewer"
+SCIENTIST = ROOT / "components/ai-scientist"
+COMPONENTS = ("search", "reviewer", "scientist")
+IDEA_REQUIRED_FIELDS = ("Name", "Title", "Task")
+
+def info(message): print(f"[tas] {message}")
+def fail(message, code=1): print(f"[tas] ERROR: {message}", file=sys.stderr); raise SystemExit(code)
+def run(command, cwd=ROOT, env=None):
+    info("$ " + " ".join(map(str, command))); subprocess.run(command, cwd=cwd, env=env, check=True)
+
+def parse_env(path=ENV_FILE):
+    values = {}
+    if not path.exists(): return values
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1); values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+def merged_env():
+    result = os.environ.copy()
+    for key, value in parse_env().items(): result.setdefault(key, value)
+    result["TAS_PROJECT_ROOT"] = str(ROOT)
+    for key in ("CLAUDE_REVIEW_BIN", "CLAUDE_SCIENTIST_BIN"):
+        value = result.get(key, "")
+        if value and not Path(value).is_absolute(): result[key] = str((ROOT / value).resolve())
+    return result
+
+def component_llm_env(env, component):
+    """Map a component-specific Anthropic endpoint onto Claude Code variables."""
+    child = env.copy(); prefix = "SCIENTIST" if component == "scientist" else "REVIEW"
+    base = env.get(f"{prefix}_ANTHROPIC_BASE_URL") or env.get("ANTHROPIC_BASE_URL", "")
+    key = env.get(f"{prefix}_ANTHROPIC_API_KEY") or env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN", "")
+    model = env.get(f"{prefix}_ANTHROPIC_MODEL") or (env.get("ANTHROPIC_MODEL", "") if component == "scientist" else env.get("REVIEW_MODEL", ""))
+    child.update({"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key, "ANTHROPIC_API_KEY": key})
+    if component == "scientist" and env.get("SCIENTIST_ANTHROPIC_MODEL"):
+        # Reviewer aliases must never leak into the Scientist process.
+        for name in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"):
+            child.pop(name, None)
+    if model:
+        child["ANTHROPIC_MODEL"] = model
+        if component == "scientist": child["SCIENTIST_ANTHROPIC_MODEL"] = model
+        else: child["REVIEW_MODEL"] = model
+    return child
+
+def set_env(updates):
+    if not ENV_FILE.exists(): shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
+    current, defaults = parse_env(), parse_env(ENV_EXAMPLE)
+    for key, value in defaults.items(): updates.setdefault(key, current.get(key, value))
+    remaining, output = dict(updates), []
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key = line.split("=", 1)[0].strip()
+            if key in remaining: output.append(f"{key}={remaining.pop(key)}"); continue
+        output.append(line)
+    if remaining: output.extend(["", *(f"{k}={v}" for k, v in remaining.items())])
+    ENV_FILE.write_text("\n".join(output) + "\n", encoding="utf-8"); ENV_FILE.chmod(0o600)
+
+def docker_ready():
+    return bool(shutil.which("docker")) and subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+def python_bin():
+    for name in ("python3.12", "python3"):
+        path = shutil.which(name)
+        if not path: continue
+        version = subprocess.run([path, "-c", "import sys;print(sys.version_info[:2])"], capture_output=True, text=True).stdout
+        if "(3, 12)" in version or "(3, 13)" in version or "(3, 14)" in version: return path
+    fail("Python 3.12+ is required")
+
+def ensure_venv(name, requirements=None, editable=None):
+    path, pip = VENVS / name, VENVS / name / "bin/pip"
+    if not pip.exists():
+        path.parent.mkdir(parents=True, exist_ok=True); run([python_bin(), "-m", "venv", str(path)]); run([str(pip), "install", "--upgrade", "pip", "wheel"])
+    if requirements: run([str(pip), "install", "-r", str(requirements)])
+    if editable: run([str(pip), "install", "-e", str(editable)])
+    return path
+
+def ensure_claude(component):
+    version = "2.1.101" if component == "reviewer" else "2.1.145"
+    prefix, binary = RUNTIME / f"claude-{component}", RUNTIME / f"claude-{component}/node_modules/.bin/claude"
+    if not binary.exists():
+        if not shutil.which("npm"): fail("Node.js/npm is required for native Reviewer and Scientist")
+        run(["npm", "install", "--prefix", str(prefix), f"@anthropic-ai/claude-code@{version}"])
+    return binary
+
+def selected(values, env=None):
+    if values:
+        invalid = [value for value in values if value not in COMPONENTS]
+        if invalid: fail("Unknown component(s): " + ", ".join(invalid))
+        return list(dict.fromkeys(values))
+    if env:
+        found = [x.strip() for x in env.get("TAS_COMPONENTS", "").split(",") if x.strip()]
+        if found: return found
+    return list(COMPONENTS)
+
+def validate_idea(path):
+    """Validate the stable user-facing portion of an idea file."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"Invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}")
+    if not isinstance(data, dict):
+        fail("Idea file must contain one JSON object")
+    missing = [key for key in IDEA_REQUIRED_FIELDS if not isinstance(data.get(key), str) or not data[key].strip()]
+    if missing:
+        fail("Idea file is missing non-empty string field(s): " + ", ".join(missing))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", data["Name"]):
+        fail("Idea Name may contain only letters, numbers, '.', '_' and '-'")
+    reviews = data.get("Human_Reviews_From_OpenReview", data.get("Human_Reviews", None))
+    if reviews is True:
+        fail("Human reviews must contain the review text or be false; true is ambiguous")
+    if reviews is not None and reviews is not False and not isinstance(reviews, (dict, list, str)):
+        fail("Human reviews must be an object, array, string, false, or omitted")
+    warnings = []
+    if reviews is None:
+        warnings.append("no human-review field found; this is valid and the AI Reviewer will provide feedback during the run")
+    sidecar = path.with_suffix(".inputs")
+    if sidecar.exists() and not sidecar.is_dir():
+        fail(f"Idea input sidecar must be a directory: {sidecar}")
+    return data, warnings
+
+def prepare_run_task(path):
+    """Make one self-contained task copy for either runtime."""
+    launch_root = SCIENTIST / ".runtime" / "launches"
+    launch_root.mkdir(parents=True, exist_ok=True)
+    launch_dir = Path(tempfile.mkdtemp(prefix=f"{path.stem}-", dir=launch_root))
+    staged_idea = launch_dir / path.name
+    staged_inputs = staged_idea.with_suffix(".inputs")
+    legacy_inputs = path.with_suffix(".inputs")
+    if legacy_inputs.is_dir():
+        shutil.copytree(legacy_inputs, staged_inputs)
+    try:
+        run([
+            sys.executable,
+            str(SCIENTIST / "scripts/prepare_paper_inputs.py"),
+            str(path),
+            str(staged_inputs),
+            str(staged_idea),
+        ])
+    except Exception:
+        shutil.rmtree(launch_dir, ignore_errors=True)
+        raise
+    return staged_idea, launch_dir
+
+def configure_interactive(runtime, components):
+    old = parse_env(); updates = {"TAS_RUNTIME": runtime, "TAS_COMPONENTS": ",".join(components), "TAS_PROJECT_ROOT": str(ROOT), "REVIEW_EXECUTION_BACKEND": "native" if runtime == "native" else "docker", "SCIENTIST_EXECUTION_BACKEND": runtime}
+    fallback_base = old.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    fallback_key = old.get("ANTHROPIC_AUTH_TOKEN") or old.get("ANTHROPIC_API_KEY", "")
+    if "reviewer" in components:
+        default = old.get("REVIEW_ANTHROPIC_BASE_URL") or fallback_base
+        base = input(f"Reviewer Anthropic-format base URL [{default}]: ").strip() or default
+        previous = old.get("REVIEW_ANTHROPIC_API_KEY") or fallback_key
+        key = getpass.getpass("Reviewer Anthropic-format API key [Enter keeps configured value]: ").strip() or previous
+        model = input(f"Reviewer model [{old.get('REVIEW_MODEL','claude-sonnet-4-6')}]: ").strip() or old.get("REVIEW_MODEL", "claude-sonnet-4-6")
+        updates.update({"REVIEW_ANTHROPIC_BASE_URL": base.rstrip("/"), "REVIEW_ANTHROPIC_API_KEY": key, "REVIEW_MODEL": model})
+    if "scientist" in components:
+        default = old.get("SCIENTIST_ANTHROPIC_BASE_URL") or fallback_base
+        base = input(f"Scientist Anthropic-format base URL [{default}]: ").strip() or default
+        previous = old.get("SCIENTIST_ANTHROPIC_API_KEY") or fallback_key
+        key = getpass.getpass("Scientist Anthropic-format API key [Enter keeps configured value]: ").strip() or previous
+        model = input(f"Scientist model [{old.get('SCIENTIST_ANTHROPIC_MODEL') or 'claude-opus-4-8[1m]'}]: ").strip() or old.get("SCIENTIST_ANTHROPIC_MODEL") or "claude-opus-4-8[1m]"
+        updates.update({"SCIENTIST_ANTHROPIC_BASE_URL": base.rstrip("/"), "SCIENTIST_ANTHROPIC_API_KEY": key, "SCIENTIST_ANTHROPIC_MODEL": model})
+    if "search" in components:
+        key = getpass.getpass("Gemini key for published search embeddings [Enter keeps configured value]: ").strip()
+        updates["GEMINI_API_KEY"] = key or old.get("GEMINI_API_KEY", "")
+    set_env(updates)
+
+def index_path(env):
+    path = Path(env.get("GEMINI_INDEX_DIR", "./data/search-index/arxiv_gemini_index")); return path if path.is_absolute() else ROOT / path
+
+def download_index(env, use_docker=False):
+    destination = index_path(env)
+    if (destination / ".complete").exists(): info(f"Search index already present at {destination}"); return
+    code = "from huggingface_hub import snapshot_download;import os,pathlib;p=pathlib.Path(os.environ['TAS_INDEX_DIR']);p.mkdir(parents=True,exist_ok=True);snapshot_download(repo_id=os.environ['GEMINI_INDEX_HF_REPO'],repo_type='dataset',local_dir=str(p));(p/'.complete').touch()"
+    child = env.copy(); info("Downloading the published ~13.3 GB search index (one time).")
+    if use_docker:
+        destination.mkdir(parents=True, exist_ok=True)
+        run(["docker", "run", "--rm", "--entrypoint", "python", "-e", "TAS_INDEX_DIR=/index", "-e", f"GEMINI_INDEX_HF_REPO={env['GEMINI_INDEX_HF_REPO']}", "-v", f"{destination}:/index", "theappliedscientist/search-api:stable", "-c", code], env=child)
+    else:
+        venv = ensure_venv("search", SEARCH / "requirements.txt")
+        child["TAS_INDEX_DIR"] = str(destination)
+        run([str(venv / "bin/python"), "-c", code], env=child)
+
+def cmd_setup(args):
+    components, runtime = selected(args.components), args.runtime or ("docker" if docker_ready() else "native")
+    if runtime == "docker" and not docker_ready(): fail("Docker runtime selected but unavailable; use --runtime native")
+    updates = {"TAS_RUNTIME": runtime, "TAS_COMPONENTS": ",".join(components), "TAS_PROJECT_ROOT": str(ROOT), "REVIEW_EXECUTION_BACKEND": "native" if runtime == "native" else "docker", "SCIENTIST_EXECUTION_BACKEND": runtime}
+    if "search" in components:
+        updates["TAS_DOCKERIZE_SEARCH"] = "1" if runtime == "docker" and args.dockerize_search else "0"
+    set_env(updates) if args.non_interactive else configure_interactive(runtime, components)
+    if not args.non_interactive and "search" in components:
+        set_env({"TAS_DOCKERIZE_SEARCH": "1" if runtime == "docker" and args.dockerize_search else "0"})
+    env = merged_env()
+    if "search" in components:
+        docker_search = runtime == "docker" and args.dockerize_search
+        if docker_search: run(["docker", "compose", "--profile", "search", "build", "search-api"], env=env)
+        else: ensure_venv("search", SEARCH / "requirements.txt")
+        if not args.skip_index: download_index(env, use_docker=docker_search)
+    if "reviewer" in components:
+        if runtime == "docker": run(["docker", "compose", "--profile", "reviewer", "build", "ai-reviewer"], env=env)
+        else: ensure_venv("reviewer", REVIEWER / "requirements.txt"); set_env({"CLAUDE_REVIEW_BIN": str(ensure_claude("reviewer"))})
+    if "scientist" in components:
+        if runtime == "docker": run(["docker", "compose", "--profile", "scientist", "build", "ai-scientist"], env=env)
+        else: set_env({"CLAUDE_SCIENTIST_BIN": str(ensure_claude("scientist"))})
+    info(f"Setup complete: {', '.join(components)} ({runtime}).")
+
+def pid_path(name): return RUNTIME / f"{name}.pid"
+def log_path(name): return RUNTIME / f"{name}.log"
+def process_running(name):
+    try: os.kill(int(pid_path(name).read_text()), 0); return True
+    except (OSError, ValueError, FileNotFoundError): pid_path(name).unlink(missing_ok=True); return False
+def start_process(name, command, cwd, env):
+    if process_running(name): info(f"{name} is already running"); return
+    RUNTIME.mkdir(parents=True, exist_ok=True); log = open(log_path(name), "ab", buffering=0)
+    proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    pid_path(name).write_text(str(proc.pid)); info(f"Started {name} (pid {proc.pid})")
+def stop_process(name):
+    if process_running(name): os.kill(int(pid_path(name).read_text()), signal.SIGTERM); pid_path(name).unlink(missing_ok=True)
+
+def start_native(component, env):
+    if component == "search":
+        py = VENVS / "search/bin/python"
+        if not py.exists(): fail("Search is not installed")
+        if not (index_path(env) / ".complete").exists(): download_index(env)
+        start_process("search", [str(py), "search_api.py", "--port", env.get("SEARCH_API_PORT", "8081"), "--gemini-index-dir", str(index_path(env))], SEARCH, env)
+    elif component == "reviewer":
+        py = VENVS / "reviewer/bin/python"
+        if not py.exists(): fail("Reviewer is not installed")
+        child = component_llm_env(env, "reviewer"); child["REVIEW_EXECUTION_BACKEND"] = "native"
+        start_process("reviewer", [str(py), "-u", "review_api.py", "--port", env.get("REVIEW_API_PORT", "8082")], REVIEWER, child)
+
+def cmd_up(args):
+    env, runtime = merged_env(), args.runtime or merged_env().get("TAS_RUNTIME", "native")
+    started = [c for c in selected(args.components, env) if c != "scientist"]
+    for component in started:
+        dockerized = runtime == "docker" and (component != "search" or args.dockerize_search or env.get("TAS_DOCKERIZE_SEARCH") == "1")
+        if dockerized: run(["docker", "compose", "--profile", component, "up", "-d", "search-api" if component == "search" else "ai-reviewer"], env=env)
+        else: start_native(component, env)
+    for component in started:
+        wait_for_health(component, env)
+    info("Requested APIs started; Scientist runs on demand with `./tas run`.")
+
+def wait_for_health(component, env):
+    port = env.get("SEARCH_API_PORT" if component == "search" else "REVIEW_API_PORT", "8081" if component == "search" else "8082")
+    timeout = int(env.get("TAS_SEARCH_STARTUP_TIMEOUT", "1200") if component == "search" else env.get("TAS_REVIEWER_STARTUP_TIMEOUT", "180"))
+    started = time.monotonic()
+    next_update = 0
+    while True:
+        code, _ = request_json(f"http://localhost:{port}/health", timeout=3)
+        if code == 200:
+            info(f"{component.capitalize()} is ready ({int(time.monotonic() - started)}s)")
+            return
+        elapsed = int(time.monotonic() - started)
+        if elapsed >= timeout:
+            fail(f"{component.capitalize()} did not become healthy within {timeout}s; run `./tas logs {component}`")
+        if elapsed >= next_update:
+            info(f"Waiting for {component} to become ready ({elapsed}s/{timeout}s)")
+            next_update = elapsed + 15
+        time.sleep(2)
+def cmd_down(args):
+    env = merged_env()
+    components = selected(args.components, env)
+    if docker_ready():
+        profiles = [item for component in components if component != "scientist" for item in ("--profile", component)]
+        run(["docker", "compose", *profiles, "down"], env=env)
+    for component in components: stop_process(component)
+
+def request_json(url, body=None, timeout=10):
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode(errors="replace"); return response.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc: return exc.code, exc.read().decode(errors="replace")
+    except Exception as exc: return 0, str(exc)
+
+def cmd_status(args):
+    env = merged_env()
+    for component in selected(args.components, env):
+        if component == "scientist": print("scientist  on-demand"); continue
+        port = env.get("SEARCH_API_PORT" if component == "search" else "REVIEW_API_PORT", "8081" if component == "search" else "8082")
+        code, result = request_json(f"http://localhost:{port}/health", timeout=3); print(f"{component:10} {'healthy' if code == 200 else f'unavailable ({result})'}")
+
+def cmd_doctor(args):
+    env, problems = merged_env(), []; components = selected(args.components, merged_env()); runtime = args.runtime or env.get("TAS_RUNTIME", "native")
+    print(f"Components   {', '.join(components)}\nRuntime      {runtime}\nDocker       {'ready' if docker_ready() else 'unavailable'}")
+    if runtime == "docker" and not docker_ready(): problems.append("Docker runtime selected but unavailable")
+    if "search" in components:
+        if not env.get("GEMINI_API_KEY"): problems.append("Search requires GEMINI_API_KEY for the published Gemini index")
+        print(f"Search index {index_path(env)} ({'ready' if (index_path(env)/'.complete').exists() else 'not downloaded'})")
+    for component in ("reviewer", "scientist"):
+        if component not in components: continue
+        child = component_llm_env(env, component)
+        if not child.get("ANTHROPIC_BASE_URL"): problems.append(f"{component}: Anthropic-format base URL is required")
+        elif any(x in child["ANTHROPIC_BASE_URL"] for x in ("/chat/completions", "/responses")): problems.append(f"{component}: Claude Code requires Anthropic Messages format, not an OpenAI route")
+        if not (child.get("ANTHROPIC_AUTH_TOKEN") or child.get("ANTHROPIC_API_KEY")): problems.append(f"{component}: Anthropic-format API key is required")
+    if runtime == "native":
+        for component, key in (("reviewer", "CLAUDE_REVIEW_BIN"), ("scientist", "CLAUDE_SCIENTIST_BIN")):
+            if component in components and not Path(env.get(key, "")).is_file(): problems.append(f"{component}: Claude Code is not installed")
+    if problems:
+        for problem in problems: print(f"ERROR: {problem}")
+        raise SystemExit(1)
+    info("Doctor found no blocking problems.")
+
+def cmd_smoke(args):
+    env, components = merged_env(), selected(args.components, merged_env())
+    if "search" in components:
+        code, result = request_json(f"http://localhost:{env.get('SEARCH_API_PORT','8081')}/batch_search", {"queries": ["autonomous scientific discovery"], "max_results": 1}, 180)
+        if code != 200: fail(f"Search smoke failed: {result}")
+        info("Search retrieval passed")
+    if "reviewer" in components:
+        code, result = request_json(f"http://localhost:{env.get('REVIEW_API_PORT','8082')}/health", timeout=10)
+        if code != 200: fail(f"Reviewer health failed: {result}")
+        info("Reviewer health passed")
+
+def cmd_run(args):
+    env = component_llm_env(merged_env(), "scientist"); env["TAS_ENV_LOADED"] = "1"; runtime = args.runtime or env.get("SCIENTIST_EXECUTION_BACKEND", env.get("TAS_RUNTIME", "native")); idea = Path(args.idea).resolve()
+    if not idea.is_file(): fail(f"Paper task file not found: {idea}")
+    try: relative = idea.relative_to(SCIENTIST)
+    except ValueError: fail("Paper task file must be inside components/ai-scientist/")
+    _, warnings = validate_idea(idea)
+    for warning in warnings: info(f"Paper task warning: {warning}")
+    staged_idea, launch_dir = prepare_run_task(idea)
+    try:
+        relative = staged_idea.relative_to(SCIENTIST)
+        extra = list(args.scientist_args)
+        if extra[:1] == ["--"]: extra = extra[1:]
+        if runtime == "docker":
+            if "--env" not in extra: extra += ["--env", "docker"]
+            run(["docker", "compose", "--profile", "scientist", "run", "--rm", "ai-scientist", str(relative), *extra], env=env)
+        else:
+            if "--env" not in extra: extra += ["--env", "native"]
+            run(["./run.sh", str(relative), *extra], cwd=SCIENTIST, env=env)
+    finally:
+        shutil.rmtree(launch_dir, ignore_errors=True)
+
+def cmd_validate(args):
+    path = Path(args.idea).resolve()
+    if not path.is_file(): fail(f"Paper task file not found: {path}")
+    _, warnings = validate_idea(path)
+    print(f"Valid paper task: {path}")
+    for warning in warnings: print(f"Warning: {warning}")
+
+def cmd_logs(args):
+    path = log_path(args.component)
+    if path.exists(): run(["tail", "-f", str(path)])
+    else: run(["docker", "compose", "logs", "-f", "search-api" if args.component == "search" else "ai-reviewer"])
+def add_components(parser): parser.add_argument("components", nargs="*", metavar="COMPONENT")
+def build_parser():
+    root = argparse.ArgumentParser(prog="tas"); sub = root.add_subparsers(dest="command", required=True)
+    setup = sub.add_parser("setup"); add_components(setup); setup.add_argument("--runtime", choices=("docker", "native")); setup.add_argument("--skip-index", action="store_true"); setup.add_argument("--dockerize-search", action="store_true"); setup.add_argument("--non-interactive", action="store_true"); setup.set_defaults(func=cmd_setup)
+    up = sub.add_parser("up"); add_components(up); up.add_argument("--runtime", choices=("docker", "native")); up.add_argument("--dockerize-search", action="store_true"); up.set_defaults(func=cmd_up)
+    down = sub.add_parser("down"); add_components(down); down.set_defaults(func=cmd_down)
+    status = sub.add_parser("status"); add_components(status); status.set_defaults(func=cmd_status)
+    doctor = sub.add_parser("doctor"); add_components(doctor); doctor.add_argument("--runtime", choices=("docker", "native")); doctor.set_defaults(func=cmd_doctor)
+    smoke = sub.add_parser("smoke"); add_components(smoke); smoke.set_defaults(func=cmd_smoke)
+    launch = sub.add_parser("run"); launch.add_argument("idea"); launch.add_argument("--runtime", choices=("docker", "native")); launch.add_argument("scientist_args", nargs=argparse.REMAINDER); launch.set_defaults(func=cmd_run)
+    validate = sub.add_parser("validate"); validate.add_argument("idea"); validate.set_defaults(func=cmd_validate)
+    logs = sub.add_parser("logs"); logs.add_argument("component", choices=("search", "reviewer")); logs.set_defaults(func=cmd_logs)
+    return root
+def main():
+    args = build_parser().parse_args()
+    try: args.func(args)
+    except subprocess.CalledProcessError as exc: fail(f"Command failed with exit code {exc.returncode}", exc.returncode)
+    except KeyboardInterrupt: fail("Interrupted", 130)
+if __name__ == "__main__": main()

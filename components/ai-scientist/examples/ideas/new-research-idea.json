@@ -1,0 +1,12 @@
+{
+  "Name": "new_example_study",
+  "Title": "A Small Reproducible Study of Example Method X",
+  "Short Hypothesis": "Method X improves metric Y over baseline Z under the stated data constraint.",
+  "Task": "Search the literature before claiming novelty. Implement baseline Z and method X on the named public dataset, run at least three seeds, report metric Y with uncertainty, record failed runs, write and compile a full paper, and iterate on feedback from the configured AI Reviewer. Stop if the resource limit is reached and report the best supported conclusion, including a negative result.",
+  "Paper": false,
+  "Human_Reviews_From_OpenReview": false,
+  "HOW_TO_RUN_EXPERIMENTS": "Use a public dataset with a fixed train/validation/test split. Keep the total GPU budget below four hours.",
+  "What_NOT_To_Do": "Do not choose the test set using validation performance. Do not fabricate numbers or citations.",
+  "GPU_Needed": true,
+  "GPU_Note": "One CUDA GPU with at least 12 GB VRAM; reduce batch size if needed."
+}
