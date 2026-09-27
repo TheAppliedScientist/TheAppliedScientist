@@ -5,10 +5,20 @@
 TheAppliedScientist searches literature, reviews papers, runs experiments, and
 revises manuscripts.
 
-[Use Search and Review](#use-search-and-review-with-mcp) ·
-[Self-host](#run-the-complete-system-yourself) ·
-[Paper JSON](#add-your-paper) ·
-[Run](#run-theappliedscientist)
+## Table of contents
+
+- [Use Search and Review with MCP](#use-search-and-review-with-mcp)
+- [Run the complete system yourself](#run-the-complete-system-yourself)
+  - [Docker](#option-a-docker)
+  - [Native, without Docker](#option-b-native-without-docker)
+- [Add your paper](#add-your-paper)
+- [Run TheAppliedScientist](#run-theappliedscientist)
+- [How the system works](#how-the-system-works)
+- [Deployment and configuration](#deployment-and-configuration)
+- [Commands](#commands)
+- [Documentation](#documentation)
+- [Security](#security)
+- [License](#license)
 
 ## Use Search and Review with MCP
 
