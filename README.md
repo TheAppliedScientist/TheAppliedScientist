@@ -12,40 +12,38 @@ revises manuscripts.
 
 ## Use Search and Review with MCP
 
-Connect only what you need. Both services run on our server; no repository or
-API key is needed to try them.
+From a Bash terminal in your paper's folder (WSL or Git Bash on Windows), run
+the block for your agent. This connects both hosted MCPs and installs the skill
+that tells your agent how to use them. No clone or API key is needed.
 
-| Tool | MCP endpoint | Use it for |
-| --- | --- | --- |
-| [Search](https://search.eigenlabs.online/docs) | `https://search.eigenlabs.online/mcp` | Find and read related papers. |
-| [AI Reviewer](https://review.eigenlabs.online/docs) | `https://review.eigenlabs.online/mcp` | Review your paper; the Reviewer searches by itself. |
-
-Claude Code, from your paper directory:
+**Claude Code**
 
 ```bash
 claude mcp add --transport http appliedscientist-search https://search.eigenlabs.online/mcp
 claude mcp add --transport http appliedscientist-review https://review.eigenlabs.online/mcp
+mkdir -p .claude/skills/appliedscientist
+curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md -o .claude/skills/appliedscientist/SKILL.md
 ```
 
-Codex, from your paper directory:
+**Codex**
 
 ```bash
 codex mcp add appliedscientist-search --url https://search.eigenlabs.online/mcp
 codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
+mkdir -p .agents/skills/appliedscientist
+curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md -o .agents/skills/appliedscientist/SKILL.md
 ```
 
-Connect only the service you need. Ask your agent to search a topic using two
-or more queries from different angles, or:
+Open your agent in that folder and ask:
 
-> Review `paper.pdf` with the AppliedScientist Reviewer. Send the file to the
-> URL returned by `review_paper`, then check `review_status` and show me the feedback.
+> Use the AppliedScientist skill to find related papers and review `papers/draft.pdf`.
 
-Replace `paper.pdf` with your own file: `paper.zip` for a LaTeX project,
-`main.tex` for a self-contained TeX file, or a Word, HTML, EPUB, or image file.
-The agent transfers that file to our VPS, then checks the review. You do not
-upload it yourself. Files can be up to 20 MB; only the first 12 rendered pages
-are reviewed. See the [short guide](docs/hosted-tools.md) for file preparation
-and Search examples, or give your agent the [MCP skill](skills/appliedscientist/SKILL.md).
+Replace the path with your PDF, a complete LaTeX `.zip`, a self-contained
+`.tex`, or another [supported file](docs/hosted-tools.md). Your agent submits
+the file and returns the review; you do not upload it separately. You can also
+ask for just a search or just a review. Reviews take several minutes and use at
+most 12 pages of a file up to 20 MB. [Search API docs](https://search.eigenlabs.online/docs)
+· [Review API docs](https://review.eigenlabs.online/docs)
 
 ## Run the complete system yourself
 
