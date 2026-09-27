@@ -59,9 +59,8 @@ pages. PDFs are cut before OCR; TeX/zip projects are compiled in isolation and
 cut before review. The Reviewer searches related work itself. A review usually
 takes several minutes, plus queue time.
 
-For a full experiment-and-revision loop, give your agent the
-[AppliedScientist skill](../skills/appliedscientist/SKILL.md). A one-off search
-or review does not need the skill.
+The [short MCP skill](../skills/appliedscientist/SKILL.md) tells an agent how to
+use both services. It does not run experiments or revise papers.
 
 ## Direct APIs and privacy
 

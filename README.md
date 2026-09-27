@@ -43,8 +43,8 @@ Replace `paper.pdf` with your own file: `paper.zip` for a LaTeX project,
 `main.tex` for a self-contained TeX file, or a Word, HTML, EPUB, or image file.
 The agent transfers that file to our VPS, then checks the review. You do not
 upload it yourself. Files can be up to 20 MB; only the first 12 rendered pages
-are reviewed. See the [short guide](docs/hosted-tools.md) for file preparation,
-Search examples, and the exact submission flow.
+are reviewed. See the [short guide](docs/hosted-tools.md) for file preparation
+and Search examples, or give your agent the [MCP skill](skills/appliedscientist/SKILL.md).
 
 ## Run the complete system yourself
 
