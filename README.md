@@ -2,26 +2,76 @@
   <img src="docs/assets/theappliedscientist-banner.webp" alt="TheAppliedScientist: Search. Experiment. Review. Revise." width="100%">
 </p>
 
-TheAppliedScientist is an end-to-end system for searching literature, running
-research experiments, reviewing papers, and revising manuscripts.
-
-It reads a paper, searches related work, runs experiments, writes a revised
-manuscript, requests an independent review, and continues improving the work.
+TheAppliedScientist searches research papers, runs experiments, reviews
+manuscripts, and revises them. Use our hosted Search and AI Reviewer with your
+existing coding agent, or run the complete system on your own machine.
 
 ## Contents
 
-- [1. Install and start](#1-install-and-start)
-- [2. Add your paper](#2-add-your-paper)
-- [3. Run TheAppliedScientist](#3-run-theappliedscientist)
-- [Deploy selected components](#deploy-selected-components)
-- [Configure LLM endpoints](#configure-llm-endpoints)
+- [Connect an existing agent](#connect-an-existing-agent)
+- [Run the complete system yourself](#run-the-complete-system-yourself)
+- [Add your paper](#add-your-paper)
+- [Run TheAppliedScientist](#run-theappliedscientist)
+- [Deployment and configuration](#deployment-and-configuration)
 
-## 1. Install and start
+## Connect an existing agent
 
-Docker and native mode both run on your machine. Neither uses a hosted execution
-service.
+You do not need to clone this repository. Connect one MCP server to Claude Code
+or Codex. Search and AI Reviewer run on our server; your agent, code, and
+experiments stay on your machine. Paper text submitted for review is sent to
+our server. No API key is needed for these hosted tools.
 
-### Clone the repository
+```bash
+# Claude Code
+claude mcp add --transport http appliedscientist https://tas-api.103-127-146-98.nip.io/mcp
+
+# Codex (use this instead if Codex is your agent)
+codex mcp add appliedscientist --url https://tas-api.103-127-146-98.nip.io/mcp
+```
+
+Ask your agent to search for related work or review your current paper. The
+`start_review` tool needs the complete current LaTeX source, title, and abstract;
+it returns a job ID. Your agent can call `review_status` until the review is
+ready. A review usually takes several minutes, plus any queue wait. The hosted
+Reviewer uses the same review prompt and runner as this repository.
+
+For the full research loop, give your agent the
+[AppliedScientist skill](skills/appliedscientist/SKILL.md). It tells the agent
+when to search, run and check experiments, request independent review, and act
+on the feedback. The MCP server also exposes it as the
+`appliedscientist_workflow` prompt. A one-off search or review does not require
+the skill.
+
+<details>
+<summary>Install the skill in a paper repository</summary>
+
+```bash
+# Claude Code
+mkdir -p .claude/skills/appliedscientist
+curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
+  -o .claude/skills/appliedscientist/SKILL.md
+```
+
+For Codex, use `.codex/skills/appliedscientist/SKILL.md` instead of the
+`.claude/skills/...` path. No other files from this repository are needed.
+
+</details>
+
+If you prefer HTTP, use the [API documentation](https://tas-api.103-127-146-98.nip.io/docs).
+The public endpoints include `POST /api/search`, `POST /api/reviews`, and
+`GET /api/reviews/{job_id}`. Reviews are limited to one active or queued request
+per IP, three submissions per IP per day, and one review running globally on
+the current host. Paper submissions and review results are deleted after seven
+days. Do not submit confidential work to a public service.
+
+## Run the complete system yourself
+
+The full local setup runs Search, AI Reviewer, and AI Scientist. It can search
+literature, run experiments on your code, revise your manuscript, and review
+the revision. Docker and native mode are both supported. Neither uses a hosted
+execution service.
+
+### Clone
 
 ```bash
 git clone https://github.com/TheAppliedScientist/TheAppliedScientist.git
@@ -143,7 +193,7 @@ Now create the project environments and install all pinned dependencies:
 `./tas setup` also installs the exact Claude Code versions used by Reviewer and
 Scientist.
 
-## 2. Add your paper
+## Add your paper
 
 Create `components/ai-scientist/user-ideas/my-paper.json`. The JSON can point directly to
 your paper, reviews, and code anywhere on the machine. Relative paths start from
@@ -197,7 +247,7 @@ Set the review field to `false`:
 You can also provide a public paper URL instead of local files. See
 [Paper task files](docs/paper-task-files.md) for all supported input forms and complete examples.
 
-## 3. Run TheAppliedScientist
+## Run TheAppliedScientist
 
 Docker without GPU:
 
@@ -249,7 +299,9 @@ machine or communicate over the network from separate machines.
 | AI Reviewer | Independently reads, checks, and scores each manuscript | 8082 |
 | AI Scientist | Runs experiments, writes the paper, and acts on reviews | On demand |
 
-## Deploy selected components
+## Deployment and configuration
+
+### Deploy selected components
 
 Each component can be installed by itself:
 
@@ -261,8 +313,10 @@ Each component can be installed by itself:
 
 This is useful when Search, Reviewer, and Scientist run on different machines.
 See [Deployment](docs/deployment.md) for complete machine-by-machine instructions.
+To operate a public Search, Reviewer, and MCP server, see the
+[hosted deployment guide](deploy/hosted/README.md).
 
-## Configure LLM endpoints
+### Configure LLM endpoints
 
 Reviewer and the default Scientist use Claude Code. Their endpoint must implement
 the Anthropic Messages API, including streaming and tool calls.

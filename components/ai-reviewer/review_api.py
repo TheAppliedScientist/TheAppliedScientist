@@ -128,6 +128,52 @@ _JOBS: dict[str, dict] = {}
 _JOBS_LOCK_KEY = "_lock"
 
 
+def _prune_expired_jobs() -> None:
+    """Expire hosted reviews; leave standalone Reviewer retention unchanged."""
+    from datetime import datetime, timedelta, timezone
+
+    retain_days = int(os.environ.get("REVIEW_RETENTION_DAYS", "0"))
+    if retain_days <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retain_days)
+    for job_id, job in list(_JOBS.items()):
+        finished_at = job.get("finished_at")
+        if finished_at and datetime.fromisoformat(finished_at) < cutoff:
+            _JOBS.pop(job_id, None)
+    if TRAJECTORY_ARCHIVE_DIR.is_dir():
+        archive = TRAJECTORY_ARCHIVE_DIR.resolve()
+        for path in archive.iterdir():
+            if (re.fullmatch(r"[0-9a-f]{12,24}", path.name)
+                    and path.is_dir() and path.resolve().parent == archive
+                    and datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < cutoff):
+                shutil.rmtree(path)
+
+
+async def _retention_loop() -> None:
+    import asyncio
+
+    while True:
+        _prune_expired_jobs()
+        await asyncio.sleep(3600)
+
+
+async def _start_retention(app: web.Application) -> None:
+    import asyncio
+
+    app["retention_task"] = asyncio.create_task(_retention_loop())
+
+
+async def _stop_retention(app: web.Application) -> None:
+    import asyncio
+
+    task = app["retention_task"]
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 async def _run_review_job(job_id: str, latex_content: str, title: str, abstract: str) -> None:
     """Run a review end-to-end and update _JOBS[job_id] with the result."""
     import asyncio
@@ -209,6 +255,7 @@ async def handle_review_start(request: web.Request) -> web.Response:
     """Async submit: returns job_id immediately, runs review in background."""
     import asyncio
 
+    _prune_expired_jobs()
     body = await request.json()
     latex_content = body.get("latex_content", "")
     title = body.get("title", "")
@@ -220,7 +267,13 @@ async def handle_review_start(request: web.Request) -> web.Response:
             status=400,
         )
 
-    job_id = uuid.uuid4().hex[:12]
+    requested_id = body.get("job_id")
+    if requested_id is not None and (not isinstance(requested_id, str) or
+                                  not re.fullmatch(r"[0-9a-f]{24}", requested_id)):
+        return web.json_response({"error": "job_id must be 24 lowercase hex characters"}, status=400)
+    job_id = requested_id or uuid.uuid4().hex[:12]
+    if job_id in _JOBS:
+        return web.json_response({"job_id": job_id, "status": _JOBS[job_id]["status"]})
     _JOBS[job_id] = {
         "job_id": job_id,
         "status": "pending",
@@ -236,6 +289,7 @@ async def handle_review_start(request: web.Request) -> web.Response:
 
 
 async def handle_review_status(request: web.Request) -> web.Response:
+    _prune_expired_jobs()
     job_id = request.match_info.get("job_id", "")
     job = _JOBS.get(job_id)
     if job is None:
@@ -361,6 +415,8 @@ def main():
         load_dotenv(env_path, override=True)
 
     app = web.Application()
+    app.on_startup.append(_start_retention)
+    app.on_cleanup.append(_stop_retention)
     app.router.add_post("/review", handle_review)
     app.router.add_post("/review/start", handle_review_start)
     app.router.add_get("/review/status/{job_id}", handle_review_status)

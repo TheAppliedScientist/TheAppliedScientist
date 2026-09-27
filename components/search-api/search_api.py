@@ -427,6 +427,7 @@ app.router.add_post("/ask_paper", handle_ask_paper)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--gemini-api-key", default=os.environ.get("GEMINI_API_KEY"))
     parser.add_argument("--gemini-index-dir", default="/workspace/gemini_index")
@@ -438,4 +439,4 @@ if __name__ == "__main__":
     log.info(f"Starting search API on :{args.port}")
     log.info(f"  Gemini index: {_gemini_index_dir}")
     log.info(f"  Both embeddings available via 'embedding' field in request body")
-    web.run_app(app, port=args.port, print=None)
+    web.run_app(app, host=args.host, port=args.port, print=None)

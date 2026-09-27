@@ -1,0 +1,23 @@
+[Unit]
+Description=TheAppliedScientist literature Search API
+After=network-online.target tas-index.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tas-search
+Group=tas-search
+WorkingDirectory=/opt/theappliedscientist/components/search-api
+EnvironmentFile=/etc/theappliedscientist-search.env
+Environment=HOME=/var/lib/theappliedscientist/search
+ExecStart=/opt/theappliedscientist/.venvs/search/bin/python search_api.py --host 127.0.0.1 --port 8081 --gemini-index-dir /opt/theappliedscientist/data/search-index/arxiv_gemini_index
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/theappliedscientist/search
+
+[Install]
+WantedBy=multi-user.target

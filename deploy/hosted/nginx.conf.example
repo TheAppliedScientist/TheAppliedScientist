@@ -1,0 +1,23 @@
+# Replace HOSTNAME before installing this file in /etc/nginx/sites-available/.
+# Certbot can add the TLS server block after this HTTP configuration is live.
+limit_req_zone $binary_remote_addr zone=tas_public:10m rate=30r/m;
+
+server {
+    listen 80;
+    server_name HOSTNAME;
+
+    client_max_body_size 3m;
+    limit_req zone=tas_public burst=30 nodelay;
+    limit_req_status 429;
+
+    location / {
+        proxy_pass http://127.0.0.1:8083;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+}

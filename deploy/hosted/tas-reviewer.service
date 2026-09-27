@@ -1,0 +1,25 @@
+[Unit]
+Description=TheAppliedScientist AI Reviewer API
+After=network-online.target tas-search.service
+Wants=network-online.target
+Requires=tas-search.service
+
+[Service]
+Type=simple
+User=tas-reviewer
+Group=tas-reviewer
+WorkingDirectory=/opt/theappliedscientist/components/ai-reviewer
+EnvironmentFile=/etc/theappliedscientist-review.env
+EnvironmentFile=/opt/theappliedscientist/deploy/hosted/review-paths.env
+Environment=HOME=/var/lib/theappliedscientist/reviewer
+ExecStart=/opt/theappliedscientist/.venvs/reviewer/bin/python -u review_api.py --host 127.0.0.1 --port 8082
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/theappliedscientist/reviewer
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=TheAppliedScientist public HTTP and MCP gateway
+After=network-online.target tas-search.service tas-reviewer.service
+Wants=network-online.target
+Requires=tas-search.service tas-reviewer.service
+
+[Service]
+Type=simple
+User=tas-gateway
+Group=tas-gateway
+WorkingDirectory=/opt/theappliedscientist
+EnvironmentFile=/etc/theappliedscientist-gateway.env
+EnvironmentFile=/opt/theappliedscientist/deploy/hosted/gateway-paths.env
+Environment=HOME=/var/lib/theappliedscientist/hosted
+Environment=HOSTED_SEARCH_INDEX_MARKER=/opt/theappliedscientist/data/search-index/arxiv_gemini_index/.complete
+ExecStart=/opt/theappliedscientist/.venvs/hosted/bin/uvicorn app:app --app-dir components/hosted-access --host 127.0.0.1 --port 8083 --workers 1 --no-proxy-headers
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/theappliedscientist/hosted
+
+[Install]
+WantedBy=multi-user.target

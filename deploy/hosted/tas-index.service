@@ -1,0 +1,24 @@
+[Unit]
+Description=Download TheAppliedScientist Search index
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tas-search
+Group=tas-search
+WorkingDirectory=/opt/theappliedscientist
+EnvironmentFile=/etc/theappliedscientist-search.env
+Environment=HOME=/var/lib/theappliedscientist/search
+ExecStartPre=+/usr/bin/install -d -o tas-search -g tas-search /opt/theappliedscientist/data/search-index
+ExecStartPre=+/usr/bin/chown -R tas-search:tas-search /opt/theappliedscientist/data/search-index
+ExecStart=/opt/theappliedscientist/.venvs/search/bin/python components/hosted-access/download_index.py
+Restart=on-failure
+RestartSec=60
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/theappliedscientist/data/search-index /var/lib/theappliedscientist/search
+
+[Install]
+WantedBy=multi-user.target
