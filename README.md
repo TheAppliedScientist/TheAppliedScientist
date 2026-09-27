@@ -34,16 +34,18 @@ mkdir -p .agents/skills/appliedscientist
 curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md -o .agents/skills/appliedscientist/SKILL.md
 ```
 
-Open your agent in that folder and ask:
+Open your agent in that folder and try one of these prompts:
 
-> Use the AppliedScientist skill to find related papers and review `papers/draft.pdf`.
+- “Use the AppliedScientist skill to review `papers/draft.pdf`.”
+- “Use the AppliedScientist skill to review `paper-source.zip`.”
+- “Use the AppliedScientist skill to search for papers on test-time adaptation for image classifiers.”
+- “Use the AppliedScientist skill to find papers related to arXiv:1706.03762.”
 
-Replace the path with your PDF, a complete LaTeX `.zip`, a self-contained
-`.tex`, or another [supported file](docs/hosted-tools.md). Your agent submits
-the file and returns the review; you do not upload it separately. You can also
-ask for just a search or just a review. Reviews take several minutes and use at
-most 12 pages of a file up to 20 MB. [Search API docs](https://search.eigenlabs.online/docs)
-· [Review API docs](https://review.eigenlabs.online/docs)
+The skill handles each request. **The Reviewer searches related work itself**;
+you do not need to run Search before a review. Your agent submits the paper for
+you. Supported files and limits are in the [short guide](docs/hosted-tools.md).
+[Search API docs](https://search.eigenlabs.online/docs) ·
+[Review API docs](https://review.eigenlabs.online/docs)
 
 ## Run the complete system yourself
 
