@@ -12,40 +12,61 @@ revises manuscripts.
 
 ## Use Search and Review with MCP
 
-From a Bash terminal in your paper's folder (WSL or Git Bash on Windows), run
-the block for your agent. This connects both hosted MCPs and installs the skill
-that tells your agent how to use them. No clone or API key is needed.
+Connect both hosted tools and the skill from your paper's folder. No clone or
+API key is needed.
 
-**Claude Code**
+### 1. Set up your agent
+
+Run one block in Bash (WSL or Git Bash on Windows).
+
+#### Claude Code
 
 ```bash
+# Connect Search and Reviewer
 claude mcp add --transport http appliedscientist-search https://search.eigenlabs.online/mcp
 claude mcp add --transport http appliedscientist-review https://review.eigenlabs.online/mcp
+
+# Install the skill in this paper folder
 mkdir -p .claude/skills/appliedscientist
-curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md -o .claude/skills/appliedscientist/SKILL.md
+curl -fsSL \
+  https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
+  -o .claude/skills/appliedscientist/SKILL.md
 ```
 
-**Codex**
+#### Codex
 
 ```bash
+# Connect Search and Reviewer
 codex mcp add appliedscientist-search --url https://search.eigenlabs.online/mcp
 codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
+
+# Install the skill in this paper folder
 mkdir -p .agents/skills/appliedscientist
-curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md -o .agents/skills/appliedscientist/SKILL.md
+curl -fsSL \
+  https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
+  -o .agents/skills/appliedscientist/SKILL.md
 ```
 
-Open your agent in that folder and try one of these prompts:
+### 2. Try it
 
-- “Use the AppliedScientist skill to review `papers/draft.pdf`.”
-- “Use the AppliedScientist skill to review `paper-source.zip`.”
-- “Use the AppliedScientist skill to search for papers on test-time adaptation for image classifiers.”
-- “Use the AppliedScientist skill to find papers related to arXiv:1706.03762.”
+Open your agent in the same folder and try one prompt:
 
-The skill handles each request. **The Reviewer searches related work itself**;
-you do not need to run Search before a review. Your agent submits the paper for
-you. Supported files and limits are in the [short guide](docs/hosted-tools.md).
+| Task | Example prompt |
+| --- | --- |
+| Review a PDF | `Use the AppliedScientist skill to review papers/draft.pdf.` |
+| Review LaTeX source | `Use the AppliedScientist skill to review paper-source.zip.` |
+| Search a topic | `Use the AppliedScientist skill to find papers on test-time adaptation for image classifiers.` |
+| Find similar papers | `Use the AppliedScientist skill to find papers related to arXiv:1706.03762.` |
+
+> [!NOTE]
+> The Reviewer searches related work itself. Use Search separately for your own
+> literature questions; you never need to search before submitting a review.
+
+[Supported paper files](docs/hosted-tools.md) ·
 [Search API docs](https://search.eigenlabs.online/docs) ·
 [Review API docs](https://review.eigenlabs.online/docs)
+
+---
 
 ## Run the complete system yourself
 
