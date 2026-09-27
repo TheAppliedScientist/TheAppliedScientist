@@ -198,15 +198,28 @@ class Store:
             ).fetchone()
             return row[0] if row else None
 
-    def next_job(self) -> dict | None:
+    def next_job(self, *, exclude_ids: tuple[str, ...] = ()) -> dict | None:
+        """Select a job not owned by a scheduler task; resume running jobs first."""
+        excluded = ""
+        if exclude_ids:
+            excluded = f"AND id NOT IN ({','.join('?' for _ in exclude_ids)})"
         with self.connection() as db:
             row = db.execute(
-                "SELECT * FROM reviews WHERE status='running' ORDER BY submitted_at LIMIT 1"
+                f"""SELECT * FROM reviews
+                    WHERE status IN ('running','preparing','pending') {excluded}
+                    ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END,
+                             submitted_at, rowid LIMIT 1""",
+                exclude_ids,
             ).fetchone()
-            if row:
-                return dict(row)
+            return dict(row) if row else None
+
+    def get_work_item(self, job_id: str) -> dict | None:
+        """Internal record for an unfinished job, including its paper input."""
+        with self.connection() as db:
             row = db.execute(
-                "SELECT * FROM reviews WHERE status IN ('preparing','pending') ORDER BY submitted_at LIMIT 1"
+                """SELECT * FROM reviews WHERE id=?
+                   AND status IN ('running','preparing','pending')""",
+                (job_id,),
             ).fetchone()
             return dict(row) if row else None
 

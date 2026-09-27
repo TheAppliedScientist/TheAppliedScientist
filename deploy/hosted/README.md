@@ -93,8 +93,12 @@ Gemini, Claude Code, or the review prompt. Check that
 `https://search.YOUR-DOMAIN/mcp` lists only Search tools and
 `https://review.YOUR-DOMAIN/mcp` lists only Review tools.
 
-The gateway runs one worker on the reference 2-core host. SQLite enforces one
-active or queued review per IP and the configured daily cap. Nginx overwrites
+The gateway runs up to five reviews at once, shared across the public API and
+Review MCP. Set `HOSTED_MAX_CONCURRENT_REVIEWS` to change this limit. Preparation
+also occupies a slot; additional reviews wait in the queue. Keep Uvicorn at
+`--workers 1` so one scheduler owns the global limit. Gateway restarts resume
+existing jobs before starting queued reviews. SQLite enforces one active or
+queued review per IP and the configured daily cap. Nginx overwrites
 `X-Real-IP`, which the gateway uses for HMAC-based per-IP accounting. Do not
 expose port 8083 directly. Finished paper text is removed from the queue at
 completion; the review result and archived trajectory are deleted after seven

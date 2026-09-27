@@ -44,6 +44,9 @@ PUBLIC_HOSTS = [
     if host.strip()
 ]
 MAX_PENDING = int(os.environ.get("HOSTED_MAX_PENDING", "10"))
+MAX_CONCURRENT_REVIEWS = int(os.environ.get("HOSTED_MAX_CONCURRENT_REVIEWS", "5"))
+if MAX_CONCURRENT_REVIEWS < 1:
+    raise ValueError("HOSTED_MAX_CONCURRENT_REVIEWS must be at least 1")
 REVIEWS_PER_IP_DAY = int(os.environ.get("HOSTED_REVIEWS_PER_IP_DAY", "3"))
 REVIEWS_GLOBAL_DAY = int(os.environ.get("HOSTED_REVIEWS_GLOBAL_DAY", "24"))
 SEARCHES_PER_IP_HOUR = int(os.environ.get("HOSTED_SEARCHES_PER_IP_HOUR", "60"))
@@ -144,19 +147,51 @@ def discard_upload(path: str) -> None:
             upload.unlink(missing_ok=True)
 
 
-async def review_worker() -> None:
-    """One worker means at most one global review on this 2-core host."""
+async def review_worker(poll_interval: float = 3) -> None:
+    """Schedule up to the global limit in this single-process gateway.
+
+    Each task owns one job until completion, including preparation and retries.
+    Existing backend jobs are resumed first after a gateway restart.
+    """
+    active: dict[str, asyncio.Task[None]] = {}
     last_cleanup = 0.0
-    async with httpx.AsyncClient(timeout=30) as client:
+    log.info("Global concurrent review limit: %s", MAX_CONCURRENT_REVIEWS)
+    try:
         while True:
             try:
+                for job_id, task in list(active.items()):
+                    if task.done():
+                        del active[job_id]
+                        if not task.cancelled() and (error := task.exception()):
+                            log.error("Review task failed for %s", job_id, exc_info=error)
                 if asyncio.get_running_loop().time() - last_cleanup > 3600:
                     store.cleanup(RETAIN_DAYS, ARCHIVE_DIR or None)
                     last_cleanup = asyncio.get_running_loop().time()
-                job = store.next_job()
+                while len(active) < MAX_CONCURRENT_REVIEWS:
+                    job = store.next_job(exclude_ids=tuple(active))
+                    if job is None:
+                        break
+                    job_id = job["id"]
+                    active[job_id] = asyncio.create_task(
+                        process_review(job_id), name=f"review-{job_id}",
+                    )
+            except Exception:
+                log.exception("Review scheduler retrying after an error")
+            await asyncio.sleep(poll_interval)
+    finally:
+        for task in active.values():
+            task.cancel()
+        await asyncio.gather(*active.values(), return_exceptions=True)
+
+
+async def process_review(job_id: str) -> None:
+    """Prepare, submit and monitor one job without giving up its review slot."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        while True:
+            try:
+                job = store.get_work_item(job_id)
                 if job is None:
-                    await asyncio.sleep(3)
-                    continue
+                    return
                 if job["status"] == "preparing":
                     upload = Path(job["input_path"])
                     remove_upload = False
@@ -266,7 +301,7 @@ async def review_worker() -> None:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Review worker retrying after an error")
+                log.exception("Review %s retrying after an error", job_id)
                 await asyncio.sleep(10)
 
 
