@@ -26,10 +26,12 @@ codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
 
 ## Use Search
 
-Ask your agent: “Find recent papers on [topic] and compare their methods.” It
-can use `search_papers` or `batch_search_papers` for discovery,
-`find_related_papers` for a known arXiv paper, and `query_papers` to ask a
-question about full papers. Search does not start a review.
+Ask your agent: “Find recent papers on [topic] using several search angles and
+compare their methods.” For discovery, prefer `batch_search_papers` with 2 to
+5 distinct queries. Use `find_related_papers` for a known arXiv paper and
+`query_papers` to ask a question about selected full papers. Search does not
+start a review. The [MCP skill](../skills/appliedscientist/SKILL.md) lists each
+tool's inputs.
 
 ## Review a paper
 
@@ -43,12 +45,13 @@ show me the feedback.” Use the same request with another file:
 | Self-contained TeX | The `.tex` file path, such as `main.tex`. |
 | LaTeX with `\input`, bibliography, styles, or figures | A `.zip` containing the full source project, such as `paper-source.zip`. |
 
-The agent calls `review_paper` with the file name. It receives a private job
-ID and a one-use HTTPS URL valid for ten minutes, sends the **file bytes** to
-that URL, and checks `review_status` until feedback is ready. You do not run
-an upload command. The file path stays on your machine; your existing agent
-transfers the bytes to our VPS. No extra local MCP process runs. A zip is
-unpacked and compiled on our VPS. A single `.tex` is compiled there too.
+The agent calls `review_paper` with the file name. This reserves a job but does
+not upload the file. The tool returns a private job ID and one-use HTTPS URL.
+Your agent sends the file to that URL within ten minutes, then checks
+`review_status` until feedback is ready. You do not run an upload command. The
+file path stays on your machine; your agent transfers the file to our VPS. No
+extra local MCP process runs. A zip is unpacked and compiled on our VPS. A
+single `.tex` is compiled there too.
 
 `title` and `abstract` are optional tool fields. Leave them out: the Reviewer
 reads the paper. Supply them only if you want to override the inferred title
@@ -58,9 +61,6 @@ The file limit is 20 MB. The Reviewer sees at most the first 12 rendered
 pages. PDFs are cut before OCR; TeX/zip projects are compiled in isolation and
 cut before review. The Reviewer searches related work itself. A review usually
 takes several minutes, plus queue time.
-
-The [short MCP skill](../skills/appliedscientist/SKILL.md) tells an agent how to
-use both services. It does not run experiments or revise papers.
 
 ## Direct APIs and privacy
 

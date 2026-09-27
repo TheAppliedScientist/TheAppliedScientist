@@ -34,7 +34,8 @@ codex mcp add appliedscientist-search --url https://search.eigenlabs.online/mcp
 codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
 ```
 
-Connect only the service you need. Ask your agent to search a topic, or:
+Connect only the service you need. Ask your agent to search a topic using two
+or more queries from different angles, or:
 
 > Review `paper.pdf` with the AppliedScientist Reviewer. Send the file to the
 > URL returned by `review_paper`, then check `review_status` and show me the feedback.
