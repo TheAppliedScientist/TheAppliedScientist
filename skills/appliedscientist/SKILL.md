@@ -1,14 +1,15 @@
 ---
 name: appliedscientist
-description: Improve a research paper through the AppliedScientist loop: literature search, real experiments, manuscript revision, independent AI Reviewer feedback, and another revision. Use when the author asks to run the full revision workflow on a paper with code. For a one-off search or review, call the MCP tools directly.
+description: "Improve a research paper through the AppliedScientist loop: literature search, real experiments, manuscript revision, independent AI Reviewer feedback, and another revision. Use when the author asks to run the full revision workflow on a paper with code. For a one-off search or review, use the hosted tools directly."
 ---
 
 # AppliedScientist
 
-Use the connected `TheAppliedScientist` MCP server. The server provides `search_papers`,
-`batch_search_papers`, `find_related_papers`, `query_papers`, `start_review`, and
-`review_status`. The hosted Reviewer uses the project's original review prompt;
-these instructions guide the research agent that acts on its feedback.
+Use the [Search MCP](https://search.eigenlabs.online/mcp) for your own
+literature work and the [Review MCP](https://review.eigenlabs.online/mcp) for
+independent feedback. The hosted Reviewer runs its own searches and uses the
+project's review prompt. These instructions guide the agent that acts on its
+feedback.
 
 This workflow follows the research process and experimental rules in the project's
 [`CLAUDE.md`](https://github.com/TheAppliedScientist/TheAppliedScientist/blob/main/components/ai-scientist/.claude/CLAUDE.md).
@@ -41,11 +42,17 @@ time and hardware, and report limitations honestly.
 
 ## Request independent review
 
-Pass the **full current LaTeX source**, title, and abstract to `start_review`.
-The tool returns a job ID immediately. Poll `review_status(job_id)` until it
-returns `success`, `error`, or `timeout`; a review commonly takes several
-minutes. Keep a frozen copy of the submitted version and the returned review.
-Do not replace the hosted review with a self-review or a generic prompt.
+Choose the current PDF or other complete manuscript file. A self-contained
+`.tex` works; if it includes other TeX files, bibliography files, or figures,
+zip the whole project. Do not send a path alone or paste base64 into the MCP.
+Call the Review MCP's `review_paper` with the file name, send the exact
+file bytes by HTTP `PUT` to its one-use `upload_url` within ten minutes, then
+call `review_status(job_id)` until `success`, `error`, or `timeout`. Do the
+transfer yourself using the agent's existing file/network tools; never ask the
+author to run an upload command. The server reviews only the first 12 rendered
+pages, including for TeX/zip. Keep a frozen copy of the submitted file and
+feedback. Do not search on the Reviewer's behalf or replace its review with a
+generic prompt. A review commonly takes several minutes plus queue time.
 
 ## Revise and repeat
 

@@ -27,6 +27,7 @@ import uuid
 from pathlib import Path
 
 from aiohttp import web
+from source_upload import MAX_ARCHIVE_BYTES, install_source
 
 BENCHMARK_SCRIPT = Path(__file__).parent / "benchmark_pass_at_k.py"
 INSTRUCTION_TEMPLATE = Path(__file__).parent / "prompts" / "paper_reviewer_instruction_template.md"
@@ -42,13 +43,16 @@ def _archive_trajectory(job_id: str, trajectory_path: Path) -> None:
     shutil.copy2(trajectory_path, dest_dir / "trajectory.json")
 
 
-def _make_task_dir(paper_dir: Path, latex_content: str, title: str, abstract: str, published: str = "") -> None:
+def _make_task_dir(paper_dir: Path, latex_content: str, title: str, abstract: str,
+                   published: str = "", input_note: str = "") -> None:
     """Create a minimal Harbor task directory for a single paper."""
     paper_dir.mkdir(parents=True, exist_ok=True)
 
     latex_dir = paper_dir / "latex"
     latex_dir.mkdir(exist_ok=True)
     (latex_dir / "template.tex").write_text(latex_content, encoding="utf-8")
+    if input_note:
+        (paper_dir / "source_note.txt").write_text(input_note, encoding="utf-8")
 
     if not published:
         from datetime import datetime, timezone
@@ -174,7 +178,9 @@ async def _stop_retention(app: web.Application) -> None:
         pass
 
 
-async def _run_review_job(job_id: str, latex_content: str, title: str, abstract: str) -> None:
+async def _run_review_job(job_id: str, latex_content: str, title: str, abstract: str,
+                          source_upload: tuple[str, bytes] | None = None,
+                          input_note: str = "") -> None:
     """Run a review end-to-end and update _JOBS[job_id] with the result."""
     import asyncio
 
@@ -187,7 +193,9 @@ async def _run_review_job(job_id: str, latex_content: str, title: str, abstract:
     trials_dir = tmp_root / "trials"
 
     try:
-        _make_task_dir(paper_dir, latex_content, title, abstract)
+        _make_task_dir(paper_dir, latex_content, title, abstract, input_note=input_note)
+        if source_upload:
+            install_source(paper_dir / "latex", *source_upload)
 
         cmd = [
             sys.executable, "-u", str(BENCHMARK_SCRIPT),
@@ -260,12 +268,15 @@ async def handle_review_start(request: web.Request) -> web.Response:
     latex_content = body.get("latex_content", "")
     title = body.get("title", "")
     abstract = body.get("abstract", "")
+    input_note = body.get("input_note", "")
 
     if not latex_content:
         return web.json_response(
             {"error": "latex_content is required"},
             status=400,
         )
+    if not isinstance(input_note, str) or len(input_note) > 500:
+        return web.json_response({"error": "input_note is too long"}, status=400)
 
     requested_id = body.get("job_id")
     if requested_id is not None and (not isinstance(requested_id, str) or
@@ -283,8 +294,52 @@ async def handle_review_start(request: web.Request) -> web.Response:
         "finished_at": None,
     }
 
-    asyncio.create_task(_run_review_job(job_id, latex_content, title, abstract))
+    asyncio.create_task(_run_review_job(job_id, latex_content, title, abstract,
+                                        input_note=input_note))
 
+    return web.json_response({"job_id": job_id, "status": "pending"})
+
+
+async def handle_review_start_source(request: web.Request) -> web.Response:
+    """Internal multipart route for TeX and LaTeX project zip files."""
+    import asyncio
+
+    _prune_expired_jobs()
+    fields: dict[str, str] = {}
+    filename = ""
+    source = bytearray()
+    reader = await request.multipart()
+    async for part in reader:
+        if part.name == "paper":
+            filename = Path(part.filename or "").name
+            while chunk := await part.read_chunk(1024 * 1024):
+                source.extend(chunk)
+                if len(source) > MAX_ARCHIVE_BYTES:
+                    return web.json_response({"error": "source upload exceeds 20 MB"}, status=413)
+        elif part.name in {"job_id", "title", "abstract"}:
+            fields[part.name] = await part.text()
+    if Path(filename).suffix.lower() not in {".tex", ".zip"} or not source:
+        return web.json_response({"error": "upload a .tex file or LaTeX .zip"}, status=400)
+    if len(fields.get("title", "")) > 500 or len(fields.get("abstract", "")) > 10_000:
+        return web.json_response({"error": "title or abstract is too long"}, status=400)
+    requested_id = fields.get("job_id")
+    if requested_id is not None and not re.fullmatch(r"[0-9a-f]{24}", requested_id):
+        return web.json_response({"error": "job_id must be 24 lowercase hex characters"}, status=400)
+    job_id = requested_id or uuid.uuid4().hex[:12]
+    if job_id in _JOBS:
+        return web.json_response({"job_id": job_id, "status": _JOBS[job_id]["status"]})
+    _JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "review_text": "",
+        "error": "",
+        "submitted_at": _now_iso(),
+        "finished_at": None,
+    }
+    asyncio.create_task(_run_review_job(
+        job_id, "", fields.get("title") or Path(filename).stem,
+        fields.get("abstract", ""), source_upload=(filename, bytes(source)),
+    ))
     return web.json_response({"job_id": job_id, "status": "pending"})
 
 
@@ -414,11 +469,12 @@ def main():
         from dotenv import load_dotenv
         load_dotenv(env_path, override=True)
 
-    app = web.Application()
+    app = web.Application(client_max_size=25 * 1024 * 1024)
     app.on_startup.append(_start_retention)
     app.on_cleanup.append(_stop_retention)
     app.router.add_post("/review", handle_review)
     app.router.add_post("/review/start", handle_review_start)
+    app.router.add_post("/review/start_source", handle_review_start_source)
     app.router.add_get("/review/status/{job_id}", handle_review_status)
     app.router.add_get("/health", handle_health)
 

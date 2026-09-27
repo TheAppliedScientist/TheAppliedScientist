@@ -1,0 +1,8 @@
+# Ubuntu 24.04 restricts unprivileged user namespaces. Allow them only for
+# this Reviewer-owned copy of Bubblewrap, not for the system-wide binary.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile tas-bwrap /opt/theappliedscientist/.runtime/bwrap flags=(unconfined) {
+  userns,
+}

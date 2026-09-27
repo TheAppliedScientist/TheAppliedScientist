@@ -36,6 +36,8 @@ class Store:
                     title TEXT NOT NULL,
                     abstract TEXT NOT NULL,
                     latex_content TEXT NOT NULL,
+                    input_path TEXT NOT NULL DEFAULT '',
+                    input_name TEXT NOT NULL DEFAULT '',
                     backend_id TEXT,
                     review_text TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
@@ -52,6 +54,10 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS usage_lookup ON usage(owner, kind, at);
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(reviews)")}
+            for name in ("input_path", "input_name"):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE reviews ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def connection(self):
@@ -86,38 +92,111 @@ class Store:
     def enqueue(self, ip: str, title: str, abstract: str, latex_content: str,
                 *, max_pending: int, max_per_day: int,
                 max_global_per_day: int = 24) -> dict:
+        return self._enqueue(ip, title, abstract, latex_content, "pending", "", "",
+                             max_pending=max_pending, max_per_day=max_per_day,
+                             max_global_per_day=max_global_per_day)
+
+    def enqueue_upload(self, ip: str, title: str, abstract: str,
+                       input_path: str, input_name: str, *, max_pending: int,
+                       max_per_day: int, max_global_per_day: int = 24) -> dict:
+        return self._enqueue(ip, title, abstract, "", "preparing", input_path, input_name,
+                             max_pending=max_pending, max_per_day=max_per_day,
+                             max_global_per_day=max_global_per_day)
+
+    def reserve_upload(self, ip: str, title: str, abstract: str, input_name: str,
+                       *, max_pending: int, max_per_day: int,
+                       max_global_per_day: int = 24) -> dict:
+        return self._enqueue(ip, title, abstract, "", "awaiting_upload", "", input_name,
+                             max_pending=max_pending, max_per_day=max_per_day,
+                             max_global_per_day=max_global_per_day)
+
+    def _enqueue(self, ip: str, title: str, abstract: str, latex_content: str,
+                 status: str, input_path: str, input_name: str, *, max_pending: int,
+                 max_per_day: int, max_global_per_day: int) -> dict:
         owner = self.owner(ip)
         now = int(time.time())
         job_id = secrets.token_urlsafe(24)
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """UPDATE reviews SET status='error', error='Upload expired',
+                   finished_at=?, updated_at=?
+                   WHERE status='awaiting_upload' AND submitted_at<?""",
+                (now, now, now - 600),
+            )
             if db.execute(
-                "SELECT 1 FROM reviews WHERE owner=? AND status IN ('pending','running') LIMIT 1",
+                "SELECT 1 FROM reviews WHERE owner=? AND status IN ('awaiting_upload','preparing','pending','running') LIMIT 1",
                 (owner,),
             ).fetchone():
                 raise LimitExceeded("This IP already has a pending or running review", 60)
             count = db.execute(
-                "SELECT COUNT(*) FROM reviews WHERE owner=? AND submitted_at>?",
+                "SELECT COUNT(*) FROM reviews WHERE owner=? AND status!='awaiting_upload' AND submitted_at>?",
                 (owner, now - 86400),
             ).fetchone()[0]
             if count >= max_per_day:
                 raise LimitExceeded("Daily review limit reached for this IP", 86400)
             global_count = db.execute(
-                "SELECT COUNT(*) FROM reviews WHERE submitted_at>?", (now - 86400,)
+                "SELECT COUNT(*) FROM reviews WHERE status!='awaiting_upload' AND submitted_at>?",
+                (now - 86400,)
             ).fetchone()[0]
             if global_count >= max_global_per_day:
                 raise LimitExceeded("Daily review capacity reached; try again tomorrow", 3600)
             waiting = db.execute(
-                "SELECT COUNT(*) FROM reviews WHERE status='pending'"
+                "SELECT COUNT(*) FROM reviews WHERE status IN ('awaiting_upload','preparing','pending')"
             ).fetchone()[0]
             if waiting >= max_pending:
                 raise LimitExceeded("Review queue is full; try again later", 300)
             db.execute(
                 """INSERT INTO reviews(id,owner,status,title,abstract,latex_content,
-                   submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (job_id, owner, "pending", title, abstract, latex_content, now, now),
+                   input_path,input_name,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, owner, status, title, abstract, latex_content,
+                 input_path, input_name, now, now),
             )
-            return {"job_id": job_id, "status": "pending", "queue_position": waiting + 1}
+            return {"job_id": job_id, "status": status, "queue_position": waiting + 1}
+
+    def attach_reserved_upload(self, job_id: str, input_path: str, *,
+                               max_per_day: int = 3,
+                               max_global_per_day: int = 24) -> None:
+        now = int(time.time())
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT owner FROM reviews WHERE id=? AND status='awaiting_upload'
+                   AND submitted_at>=?""",
+                (job_id, now - 600),
+            ).fetchone()
+            if not row:
+                raise ValueError("Upload link is unknown, expired, or already used")
+            count = db.execute(
+                """SELECT COUNT(*) FROM reviews WHERE owner=? AND status!='awaiting_upload'
+                   AND submitted_at>?""",
+                (row[0], now - 86400),
+            ).fetchone()[0]
+            if count >= max_per_day:
+                raise LimitExceeded("Daily review limit reached for this IP", 86400)
+            global_count = db.execute(
+                """SELECT COUNT(*) FROM reviews WHERE status!='awaiting_upload'
+                   AND submitted_at>?""",
+                (now - 86400,),
+            ).fetchone()[0]
+            if global_count >= max_global_per_day:
+                raise LimitExceeded("Daily review capacity reached; try again tomorrow", 3600)
+            result = db.execute(
+                """UPDATE reviews SET status='preparing', input_path=?, updated_at=?
+                   WHERE id=? AND status='awaiting_upload' AND submitted_at>=?""",
+                (input_path, now, job_id, now - 600),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Upload link is unknown, expired, or already used")
+
+    def reserved_upload_name(self, job_id: str) -> str | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT input_name FROM reviews WHERE id=? AND status='awaiting_upload'
+                   AND submitted_at>=?""",
+                (job_id, int(time.time()) - 600),
+            ).fetchone()
+            return row[0] if row else None
 
     def next_job(self) -> dict | None:
         with self.connection() as db:
@@ -127,14 +206,36 @@ class Store:
             if row:
                 return dict(row)
             row = db.execute(
-                "SELECT * FROM reviews WHERE status='pending' ORDER BY submitted_at LIMIT 1"
+                "SELECT * FROM reviews WHERE status IN ('preparing','pending') ORDER BY submitted_at LIMIT 1"
             ).fetchone()
             return dict(row) if row else None
+
+    def set_prepared(self, job_id: str, paper_text: str, title: str) -> None:
+        with self.connection() as db:
+            result = db.execute(
+                """UPDATE reviews SET status='pending', latex_content=?, title=?,
+                   input_path='', updated_at=?
+                   WHERE id=? AND status='preparing'""",
+                (paper_text, title, int(time.time()), job_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("review upload is no longer preparing")
+
+    def set_source_ready(self, job_id: str, title: str) -> None:
+        with self.connection() as db:
+            result = db.execute(
+                """UPDATE reviews SET status='pending', title=?, updated_at=?
+                   WHERE id=? AND status='preparing' AND input_path!=''""",
+                (title, int(time.time()), job_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("review source upload is no longer preparing")
 
     def set_running(self, job_id: str, backend_id: str) -> None:
         with self.connection() as db:
             db.execute(
-                "UPDATE reviews SET status='running', backend_id=?, updated_at=? WHERE id=?",
+                """UPDATE reviews SET status='running', backend_id=?,
+                   input_path='', input_name='', updated_at=? WHERE id=?""",
                 (backend_id, int(time.time()), job_id),
             )
 
@@ -145,6 +246,7 @@ class Store:
         with self.connection() as db:
             db.execute(
                 """UPDATE reviews SET status=?, review_text=?, error=?, latex_content='',
+                   input_path='', input_name='',
                    updated_at=?, finished_at=? WHERE id=?""",
                 (status, review_text, error, now, now, job_id),
             )
@@ -161,16 +263,24 @@ class Store:
                 return None
             result = dict(row)
             result.pop("backend_id")
-            if result["status"] == "pending":
+            if result["status"] in {"awaiting_upload", "preparing", "pending"}:
                 result["queue_position"] = db.execute(
-                    "SELECT COUNT(*) FROM reviews WHERE status='pending' AND submitted_at<=?",
+                    """SELECT COUNT(*) FROM reviews WHERE status IN ('awaiting_upload','preparing','pending')
+                       AND submitted_at<=?""",
                     (result["submitted_at"],),
                 ).fetchone()[0]
             return result
 
     def cleanup(self, retain_days: int, archive_dir: str | Path | None = None) -> None:
-        cutoff = int(time.time()) - retain_days * 86400
+        now = int(time.time())
+        cutoff = now - retain_days * 86400
         with self.connection() as db:
+            db.execute(
+                """UPDATE reviews SET status='error', error='Upload expired',
+                   finished_at=?, updated_at=?
+                   WHERE status='awaiting_upload' AND submitted_at<?""",
+                (now, now, now - 600),
+            )
             old_ids = [row[0] for row in db.execute(
                 "SELECT backend_id FROM reviews WHERE finished_at<? AND backend_id IS NOT NULL",
                 (cutoff,),

@@ -555,8 +555,13 @@ async def run_single_attempt(
     start_time = time.time()
     if os.environ.get("REVIEW_EXECUTION_BACKEND", "native") != "harbor-docker":
         try:
+            meta_path = task_dir / "task_metadata.json"
+            metadata = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+            published = metadata.get("published") or datetime.now(timezone.utc).isoformat()
+            cutoff_month = _published_to_cutoff_month(published)
             trajectory_path, native_metadata = await run_native_review(
-                task_dir, result_dir, search_api_url, paper_id, attempt_idx
+                task_dir, result_dir, search_api_url, paper_id, attempt_idx,
+                cutoff_month=cutoff_month,
             )
         except Exception as e:
             logger.error(f"Native reviewer failed for {paper_id} attempt {attempt_idx}: {e}")

@@ -2,67 +2,49 @@
   <img src="docs/assets/theappliedscientist-banner.webp" alt="TheAppliedScientist: Search. Experiment. Review. Revise." width="100%">
 </p>
 
-TheAppliedScientist searches research papers, runs experiments, reviews
-manuscripts, and revises them. Use our hosted Search and AI Reviewer with your
-existing coding agent, or run the complete system on your own machine.
+TheAppliedScientist searches literature, reviews papers, runs experiments, and
+revises manuscripts.
 
-## Contents
+[Use Search and Review](#use-search-and-review-with-mcp) ·
+[Self-host](#run-the-complete-system-yourself) ·
+[Paper JSON](#add-your-paper) ·
+[Run](#run-theappliedscientist)
 
-- [Connect an existing agent](#connect-an-existing-agent)
-- [Run the complete system yourself](#run-the-complete-system-yourself)
-- [Add your paper](#add-your-paper)
-- [Run TheAppliedScientist](#run-theappliedscientist)
-- [Deployment and configuration](#deployment-and-configuration)
+## Use Search and Review with MCP
 
-## Connect an existing agent
+Connect only what you need. Both services run on our server; no repository or
+API key is needed to try them.
 
-You do not need to clone this repository. Connect one MCP server to Claude Code
-or Codex. Search and AI Reviewer run on our server; your agent, code, and
-experiments stay on your machine. Paper text submitted for review is sent to
-our server. No API key is needed for these hosted tools.
+| Tool | MCP endpoint | Use it for |
+| --- | --- | --- |
+| [Search](https://search.eigenlabs.online/docs) | `https://search.eigenlabs.online/mcp` | Find and read related papers. |
+| [AI Reviewer](https://review.eigenlabs.online/docs) | `https://review.eigenlabs.online/mcp` | Review your paper; the Reviewer searches by itself. |
 
-```bash
-# Claude Code
-claude mcp add --transport http appliedscientist https://tas-api.103-127-146-98.nip.io/mcp
-
-# Codex (use this instead if Codex is your agent)
-codex mcp add appliedscientist --url https://tas-api.103-127-146-98.nip.io/mcp
-```
-
-Ask your agent to search for related work or review your current paper. The
-`start_review` tool needs the complete current LaTeX source, title, and abstract;
-it returns a job ID. Your agent can call `review_status` until the review is
-ready. A review usually takes several minutes, plus any queue wait. The hosted
-Reviewer uses the same review prompt and runner as this repository.
-
-For the full research loop, give your agent the
-[AppliedScientist skill](skills/appliedscientist/SKILL.md). It tells the agent
-when to search, run and check experiments, request independent review, and act
-on the feedback. The MCP server also exposes it as the
-`appliedscientist_workflow` prompt. A one-off search or review does not require
-the skill.
-
-<details>
-<summary>Install the skill in a paper repository</summary>
+Claude Code, from your paper directory:
 
 ```bash
-# Claude Code
-mkdir -p .claude/skills/appliedscientist
-curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
-  -o .claude/skills/appliedscientist/SKILL.md
+claude mcp add --transport http appliedscientist-search https://search.eigenlabs.online/mcp
+claude mcp add --transport http appliedscientist-review https://review.eigenlabs.online/mcp
 ```
 
-For Codex, use `.codex/skills/appliedscientist/SKILL.md` instead of the
-`.claude/skills/...` path. No other files from this repository are needed.
+Codex, from your paper directory:
 
-</details>
+```bash
+codex mcp add appliedscientist-search --url https://search.eigenlabs.online/mcp
+codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
+```
 
-If you prefer HTTP, use the [API documentation](https://tas-api.103-127-146-98.nip.io/docs).
-The public endpoints include `POST /api/search`, `POST /api/reviews`, and
-`GET /api/reviews/{job_id}`. Reviews are limited to one active or queued request
-per IP, three submissions per IP per day, and one review running globally on
-the current host. Paper submissions and review results are deleted after seven
-days. Do not submit confidential work to a public service.
+Connect only the service you need. Ask your agent to search a topic, or:
+
+> Review `paper.pdf` with the AppliedScientist Reviewer. Send the file to the
+> URL returned by `review_paper`, then check `review_status` and show me the feedback.
+
+Replace `paper.pdf` with your own file: `paper.zip` for a LaTeX project,
+`main.tex` for a self-contained TeX file, or a Word, HTML, EPUB, or image file.
+The agent transfers that file to our VPS, then checks the review. You do not
+upload it yourself. Files can be up to 20 MB; only the first 12 rendered pages
+are reviewed. See the [short guide](docs/hosted-tools.md) for file preparation,
+Search examples, and the exact submission flow.
 
 ## Run the complete system yourself
 

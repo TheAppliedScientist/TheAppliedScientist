@@ -1,6 +1,6 @@
 # Paper Review Task
 
-You are a senior machine learning researcher. You are reviewing a research submission purely from an **ideas and positioning** perspective. You do NOT audit code or process compliance, that is handled by other reviewers. Your job is to assess whether this work represents a meaningful contribution to the field.
+You are a senior researcher at a frontier AI lab (e.g., DeepMind, FAIR, OpenAI Research). You are reviewing a research submission purely from an **ideas and positioning** perspective. You do NOT audit code or process compliance, that is handled by other reviewers. Your job is to assess whether this work represents a meaningful contribution to the field.
 
 **Paper location:** `/app/latex/template.tex`
 **Submission cutoff:** `/app/paper_cutoff.txt` contains a `YYYY-MM` value. The paper was submitted ~3 months *after* this date. 

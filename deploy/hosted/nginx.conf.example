@@ -6,7 +6,7 @@ server {
     listen 80;
     server_name HOSTNAME;
 
-    client_max_body_size 3m;
+    client_max_body_size 25m;
     limit_req zone=tas_public burst=30 nodelay;
     limit_req_status 429;
 

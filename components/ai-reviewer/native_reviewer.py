@@ -25,10 +25,19 @@ def _native_path(path: str, workspace: Path) -> str:
     return path.replace("/app", str(workspace))
 
 
-def _copy_runtime_files(task_dir: Path, workspace: Path, search_api_url: str) -> str:
+def _copy_runtime_files(
+    task_dir: Path, workspace: Path, search_api_url: str, cutoff_month: str | None,
+) -> str:
     shutil.copytree(task_dir, workspace, dirs_exist_ok=True)
     prompt = (PROJECT_DIR / "prompts/paper_reviewer_instruction_template.md").read_text()
     prompt = _native_path(prompt, workspace)
+    note_path = workspace / "source_note.txt"
+    if note_path.is_file():
+        note = _native_path(note_path.read_text(encoding="utf-8").strip(), workspace)
+        location = prompt.find("**Paper location:**")
+        if location >= 0:
+            line_end = prompt.find("\n", location)
+            prompt = prompt[:line_end + 1] + note + "\n" + prompt[line_end + 1:]
     (workspace / "instruction.md").write_text(prompt, encoding="utf-8")
 
     skill_dir = workspace / ".claude/skills/search-papers"
@@ -42,6 +51,8 @@ def _copy_runtime_files(task_dir: Path, workspace: Path, search_api_url: str) ->
     # locations leaves its API behavior unchanged.
     search.write_text(_native_path(search.read_text(), workspace), encoding="utf-8")
     (workspace / "search_api_url.txt").write_text(search_api_url, encoding="utf-8")
+    if cutoff_month:
+        (workspace / "paper_cutoff.txt").write_text(cutoff_month, encoding="utf-8")
     return prompt
 
 
@@ -64,12 +75,13 @@ async def run_native_review(
     search_api_url: str,
     paper_id: str,
     attempt_idx: int,
+    cutoff_month: str | None,
 ) -> tuple[Path, dict]:
     """Run one reviewer attempt and return ``(trajectory_path, metadata)``."""
     base = Path(os.environ.get("TAS_NATIVE_JOB_DIR", tempfile.gettempdir()))
     base.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix="tas-review-", dir=base))
-    prompt = _copy_runtime_files(task_dir, workspace, search_api_url)
+    prompt = _copy_runtime_files(task_dir, workspace, search_api_url, cutoff_month)
     claude = os.environ.get("CLAUDE_REVIEW_BIN", "claude")
     if not Path(claude).is_absolute():
         resolved = shutil.which(claude)
@@ -80,7 +92,8 @@ async def run_native_review(
     model = os.environ.get("REVIEW_MODEL", os.environ.get("ANTHROPIC_MODEL", ""))
     command = [
         claude, "--print", "--verbose", "--output-format", "stream-json",
-        "--permission-mode", "bypassPermissions", "--model", model, prompt,
+        "--permission-mode", "bypassPermissions", "--model", model,
+        "--effort", os.environ.get("REVIEW_REASONING_EFFORT", "high"), prompt,
     ]
     child_env = os.environ.copy()
     preexec_fn = None
