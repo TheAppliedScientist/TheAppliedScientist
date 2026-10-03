@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="126" viewBox="0 0 1100 126" role="img" aria-labelledby="title desc">
+  <title id="title">Run individual components</title>
+  <desc id="desc">Choose Search, Reviewer, or Scientist. Use one machine or several.</desc>
+  <rect width="1100" height="126" rx="16" fill="#f5f2ec"/>
+  <rect x="0" y="18" width="5" height="90" rx="2.5" fill="#7c3aed"/>
+  <rect x="26" y="24" width="130" height="25" rx="6" fill="#7c3aed"/>
+  <text x="38" y="41" fill="#fff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" letter-spacing="1.2">COMPONENTS</text>
+  <text x="26" y="85" fill="#1e302b" font-family="Arial, Helvetica, sans-serif" font-size="31" font-weight="700">Run individual components</text>
+  <text x="26" y="110" fill="#5c665f" font-family="Arial, Helvetica, sans-serif" font-size="16">Choose Search, Reviewer, or Scientist. Use one machine or several.</text>
+</svg>

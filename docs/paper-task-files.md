@@ -1,15 +1,33 @@
 # Run TheAppliedScientist on your paper
 
-Create one JSON file for the paper. It can name local files and directories by
-absolute path or by a path relative to the JSON file. The runner copies them to
-`/app/inputs/` for both Docker and native runs. The originals are not changed.
+[Folder layout and runnable example](../README.md#add-your-paper)
 
-For example:
+The configuration file lives inside `components/ai-scientist/user-ideas/` in
+your repository checkout. You can keep the inputs beside it:
+
+```text
+user-ideas/
+├── my-paper.json
+└── my-paper/
+    ├── paper-source/     # complete LaTeX project, including figures and bibliography
+    ├── code/             # experiment code
+    └── reviews.md        # all existing review text
+```
+
+Paths are relative to `my-paper.json`. For this layout, `my-paper/reviews.md`
+names the review file shown above. Absolute paths work too, so your inputs
+can remain elsewhere on the machine.
+
+The runner copies the inputs into each job's workspace for both Docker and
+native runs. The originals are not changed.
+
+For a LaTeX project, pass the whole source directory so that figures, bibliography,
+styles, and files included by `\input` are copied too. For example:
 
 ```json
 "Paper": {
-  "local_path": "/path/to/paper/main.tex",
-  "code_path": "/path/to/code"
+  "local_path": "my-paper/paper-source",
+  "code_path": "my-paper/code"
 }
 ```
 
@@ -21,8 +39,12 @@ For example:
 | `Title` | string | The paper title |
 | `Task` | string | What to reproduce, test, improve, and deliver |
 
-The `Task` should name the paper and code paths, important experiments and
-metrics, time or hardware limits, and the required final result.
+Use `Task` to describe the important experiments and metrics, time or hardware
+limits, and the required final result. Paths in `Paper` are staged automatically.
+Code is optional but strongly recommended for reproducing and improving results.
+
+For a self-contained TeX file or PDF, `local_path` can name that file instead of
+a directory. Source files are preferable when the Scientist will revise the paper.
 
 ## Useful optional fields
 
@@ -40,11 +62,13 @@ Extra fields are allowed and passed to the Scientist unchanged.
 
 ## Paper with public reviews
 
-Point the JSON to the review file:
+Paste your existing reviews into `my-paper/reviews.md` next to the JSON as
+shown above. Plain text in a Markdown file is sufficient; no special format is
+required. Then point the JSON to that file:
 
 ```json
 "Human_Reviews_From_OpenReview": {
-  "source_file": "/path/to/reviews.md"
+  "source_file": "my-paper/reviews.md"
 }
 ```
 
@@ -90,6 +114,14 @@ and never place credentials in the JSON or its referenced inputs.
 ```bash
 ./tas run components/ai-scientist/user-ideas/my-paper.json -- --timeout 21600 --gpus 1
 ```
+
+Omit `--gpus 1` for Docker CPU runs. For native mode, use:
+
+```bash
+./tas run --runtime native components/ai-scientist/user-ideas/my-paper.json -- --timeout 21600
+```
+
+Native mode uses host devices directly and does not accept `--gpus`.
 
 The runner checks the JSON automatically before starting. Invalid JSON, missing
 required fields, invalid names, and `Human_Reviews_From_OpenReview: true` are

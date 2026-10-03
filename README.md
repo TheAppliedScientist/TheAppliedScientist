@@ -2,223 +2,177 @@
   <img src="docs/assets/theappliedscientist-banner.webp" alt="TheAppliedScientist: Search. Experiment. Review. Revise." width="100%">
 </p>
 
-TheAppliedScientist searches literature, reviews papers, runs experiments, and
-revises manuscripts.
+<p align="center">
+  <a href="https://arxiv.org/abs/2609.14738"><img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?style=flat-square&amp;logo=arxiv" alt="Read the paper"></a>
+  <a href="https://theappliedscientist.github.io/"><img src="https://img.shields.io/badge/Project-Website-0f766e?style=flat-square" alt="Project website"></a>
+  <a href="https://search.eigenlabs.online/docs"><img src="https://img.shields.io/badge/API-Search-2563eb?style=flat-square" alt="Search API documentation"></a>
+  <a href="https://review.eigenlabs.online/docs"><img src="https://img.shields.io/badge/API-Reviewer-7c3aed?style=flat-square" alt="Review API documentation"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-475569?style=flat-square" alt="MIT license"></a>
+</p>
 
-## Table of contents
+<h1 align="center">TheAppliedScientist</h1>
 
-- [Use Search and Review with MCP](#use-search-and-review-with-mcp)
-- [Run the complete system yourself](#run-the-complete-system-yourself)
-  - [Docker](#option-a-docker)
-  - [Native, without Docker](#option-b-native-without-docker)
-- [Add your paper](#add-your-paper)
-- [Run TheAppliedScientist](#run-theappliedscientist)
-- [How the system works](#how-the-system-works)
-- [Deployment and configuration](#deployment-and-configuration)
-- [Commands](#commands)
-- [Documentation](#documentation)
-- [Security](#security)
-- [License](#license)
+TheAppliedScientist searches literature, reviews papers, runs experiments, and revises manuscripts.
 
-## Use Search and Review with MCP
+**Contents**
 
-Connect both hosted tools and the skill from your paper's folder. No clone or
-API key is needed.
+[Hosted MCPs](#use-search-and-review-with-mcp) · [Full setup](#run-the-complete-system-yourself) · [Your paper](#add-your-paper) · [Individual components](#run-individual-components) · [Docs](#documentation)
 
-### 1. Set up your agent
+<table>
+<tr>
+<td width="33%"><a href="#use-search-and-review-with-mcp"><img src="docs/assets/start-hosted.svg" alt="Hosted MCPs: connect your coding agent" width="100%"></a></td>
+<td width="33%"><a href="#run-the-complete-system-yourself"><img src="docs/assets/start-full.svg" alt="Full system: run experiments, reviews, and revisions" width="100%"></a></td>
+<td width="33%"><a href="#run-individual-components"><img src="docs/assets/start-components.svg" alt="Individual components: choose Search, Reviewer, or Scientist" width="100%"></a></td>
+</tr>
+</table>
 
-Run one block in Bash (WSL or Git Bash on Windows).
+<a name="use-search-and-review-with-mcp"></a>
 
-#### Claude Code
+## ![Use Search and Review with MCP](docs/assets/section-hosted.svg)
+
+In your paper's folder, run the block for your agent. Use Bash on Linux/macOS or WSL/Git Bash on Windows.
+
+<details open>
+<summary><strong>Claude Code</strong></summary>
 
 ```bash
-# Connect Search and Reviewer
 claude mcp add --transport http appliedscientist-search https://search.eigenlabs.online/mcp
 claude mcp add --transport http appliedscientist-review https://review.eigenlabs.online/mcp
 
-# Install the skill in this paper folder
 mkdir -p .claude/skills/appliedscientist
-curl -fsSL \
-  https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
   -o .claude/skills/appliedscientist/SKILL.md
 ```
 
-#### Codex
+</details>
+
+<details>
+<summary><strong>Codex</strong></summary>
 
 ```bash
-# Connect Search and Reviewer
 codex mcp add appliedscientist-search --url https://search.eigenlabs.online/mcp
 codex mcp add appliedscientist-review --url https://review.eigenlabs.online/mcp
 
-# Install the skill in this paper folder
 mkdir -p .agents/skills/appliedscientist
-curl -fsSL \
-  https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/TheAppliedScientist/TheAppliedScientist/main/skills/appliedscientist/SKILL.md \
   -o .agents/skills/appliedscientist/SKILL.md
 ```
 
-### 2. Try it
+No login is needed. Ignore Codex's suggestion to run `codex mcp login`.
 
-Open your agent in the same folder and try one prompt:
+</details>
 
-| Task | Example prompt |
+Open or restart your agent in that folder and try one of these requests.
+
+| Review | Search |
 | --- | --- |
-| Review a PDF | `Use the AppliedScientist skill to review papers/draft.pdf.` |
-| Review LaTeX source | `Use the AppliedScientist skill to review paper-source.zip.` |
-| Search a topic | `Use the AppliedScientist skill to find papers on test-time adaptation for image classifiers.` |
-| Find similar papers | `Use the AppliedScientist skill to find papers related to arXiv:1706.03762.` |
+| `Use the AppliedScientist skill to review papers/draft.pdf.` | `Use the AppliedScientist skill to find papers on test-time adaptation.` |
+| `Use the AppliedScientist skill to review paper-source.zip.` | `Use the AppliedScientist skill to find papers related to arXiv:1706.03762.` |
 
-> [!NOTE]
-> The Reviewer searches related work itself. Use Search separately for your own
-> literature questions; you never need to search before submitting a review.
+> Your agent uploads the file and retrieves the review. The Reviewer handles its own literature searches.
 
-[Supported paper files](docs/hosted-tools.md) ·
-[Search API docs](https://search.eigenlabs.online/docs) ·
-[Review API docs](https://review.eigenlabs.online/docs)
+**Review limits**
 
----
+20 MB per file · first 12 rendered pages · several minutes plus queue time.
 
-## Run the complete system yourself
+[File formats](docs/hosted-tools.md) · [Usage skill](skills/appliedscientist/SKILL.md) · [Search API docs](https://search.eigenlabs.online/docs) · [Review API docs](https://review.eigenlabs.online/docs)
 
-The full local setup runs Search, AI Reviewer, and AI Scientist. It can search
-literature, run experiments on your code, revise your manuscript, and review
-the revision. Docker and native mode are both supported. Neither uses a hosted
-execution service.
+<a name="run-the-complete-system-yourself"></a>
 
-### Clone
+## ![Run the complete system yourself](docs/assets/section-setup.svg)
+
+### 1. Install prerequisites and clone
+
+| Choose a runtime | Prerequisites |
+| --- | --- |
+| **Docker** | Python 3.12, Git, Docker Engine 27+, Compose 2.30+ |
+| **Native, without Docker** | Python 3.12, Node.js 22, Git, uv, and [research tools](docs/installation.md) |
+
+Install on [Linux](docs/installation.md#linux) · [macOS](docs/installation.md#macos) · [Windows / WSL 2](docs/installation.md#windows)
+
+Allow about **20 GB** for Search/Reviewer or **60 GB** for Docker GPU runs. Search downloads a 13 GB index once.
 
 ```bash
 git clone https://github.com/TheAppliedScientist/TheAppliedScientist.git
 cd TheAppliedScientist
 ```
 
-### Option A: Docker
+### 2. Prepare API keys
 
-Use Docker Engine 27+ with Docker Compose 2.30+ and Python 3.12+. Keep at least
-20 GB free for Search and Reviewer. A GPU Scientist run also needs about 60 GB
-free because its CUDA, LaTeX, and experiment images are large.
+Setup asks for these values and saves them in `.env`.
 
-Install Docker for your operating system:
+| Component | Have ready |
+| --- | --- |
+| Search embeddings | A [Gemini API key](https://ai.google.dev/gemini-api/docs/api-key) |
+| Search full-paper answers | Uses the same Gemini key with `gemini-3-flash-preview` by default |
+| AI Reviewer | Endpoint URL, API key, and model name |
+| AI Scientist | Endpoint URL, API key, and model name |
 
-- [Linux: Docker Engine and Compose](https://docs.docker.com/engine/install/)
-- [macOS: Docker Desktop](https://docs.docker.com/desktop/setup/install/mac-install/)
-- [Windows: Docker Desktop with WSL 2](https://docs.docker.com/desktop/setup/install/windows-install/)
+> **Reviewer and Scientist need Anthropic-compatible endpoints.** OpenAI-only endpoints need a converter for Claude Code. [Provider settings](docs/llm-providers.md).
 
-Check the installation:
+To change Search's answer model, edit `SEARCH_QUERY_*` in `.env` **after setup, before startup**. [Examples](docs/llm-providers.md#search).
 
-```bash
-python3 --version
-docker --version
-docker compose version
-```
+### 3. Install components and start the APIs
 
-Set up and start all three components:
+Choose **one** runtime.
+
+<details open>
+<summary><strong>Docker (Search on the host; Reviewer and Scientist in containers)</strong></summary>
 
 ```bash
 ./tas setup search reviewer scientist --runtime docker
+./tas doctor
 ./tas up
 ./tas smoke
 ```
 
-This setup runs Search with local Python and runs Reviewer and Scientist with
-local Docker. The first run downloads a search index of about 13 GB.
-
-To run Search in Docker too:
-
-```bash
-./tas setup search reviewer scientist --runtime docker --dockerize-search
-./tas up
-```
-
-For `--gpus 1`, install the NVIDIA driver and NVIDIA Container Toolkit, then
-verify Docker can see the GPU:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
-```
-
-Use the official [NVIDIA Container Toolkit installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-
-### Option B: Native, without Docker
-
-Install Python 3.12, Node.js 22, Git, curl, Pandoc, and LaTeX.
-
-<details>
-<summary><strong>Ubuntu 22.04 or 24.04</strong></summary>
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git curl ca-certificates \
-  pandoc latexmk texlive-latex-base texlive-latex-extra texlive-fonts-recommended
-
-curl -LsSf https://astral.sh/uv/install.sh | sh
-. "$HOME/.local/bin/env"
-uv python install 3.12
-
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-python3.12 --version
-node --version
-npm --version
-```
-
-The NodeSource command may report unrelated third-party repository warnings. A
-final `Repository configured successfully` message means it worked.
+Add `--dockerize-search` to setup if you also want Search in Docker.
 
 </details>
 
 <details>
-<summary><strong>macOS with Homebrew</strong></summary>
-
-```bash
-brew install python@3.12 node@22 git curl pandoc mactex-no-gui
-brew link --overwrite --force node@22
-
-python3.12 --version
-node --version
-npm --version
-```
-
-</details>
-
-<details>
-<summary><strong>Windows</strong></summary>
-
-Run native mode inside WSL 2. In an Administrator PowerShell window:
-
-```powershell
-wsl --install -d Ubuntu-24.04
-```
-
-Open Ubuntu from the Start menu, clone the repository there, then use the
-Ubuntu commands above.
-
-</details>
-
-Now create the project environments and install all pinned dependencies:
+<summary><strong>Native (without Docker)</strong></summary>
 
 ```bash
 ./tas setup search reviewer scientist --runtime native
-./tas up search reviewer --runtime native
-./tas smoke search reviewer
+./tas doctor
+./tas up
+./tas smoke
 ```
 
-`./tas setup` also installs the exact Claude Code versions used by Reviewer and
-Scientist.
+</details>
 
-## Add your paper
+Search runs on port **8081** and Reviewer on **8082**. `smoke` tests Search retrieval and Reviewer health.
 
-Create `components/ai-scientist/user-ideas/my-paper.json`. The JSON can point directly to
-your paper, reviews, and code anywhere on the machine. Relative paths start from
-the JSON file. The runner copies those inputs into an isolated workspace and
-does not modify the originals.
+**Add your paper below, then start TheAppliedScientist.**
 
-#### When public reviews are available
+<a name="add-your-paper"></a>
 
-Use this JSON and replace the three paths. Code is optional, but strongly
-recommended because it lets TheAppliedScientist reproduce and improve real
-results.
+## ![Add your paper](docs/assets/section-paper.svg)
+
+### 4. Place your files
+
+Inside the cloned repository, open **`components/ai-scientist/user-ideas/`**. Use this folder layout.
+
+```text
+user-ideas/
+├── my-paper.json             ← the configuration you create in step 5
+└── my-paper/
+    ├── paper-source/         ← your complete LaTeX project
+    │   ├── main.tex
+    │   ├── references.bib
+    │   └── figures/
+    ├── code/                 ← your experiment code, strongly recommended
+    └── reviews.md            ← paste all existing reviews here
+```
+
+Use your actual LaTeX filenames. Include any style files and other source dependencies.
+
+If you have no reviews, omit `reviews.md` and set `Human_Reviews_From_OpenReview` to `false`. If you have no code, omit `code/` and remove `code_path`.
+
+### 5. Create `my-paper.json`
+
+These paths start from the folder containing **`my-paper.json`**. Absolute paths work too.
 
 ```json
 {
@@ -226,162 +180,111 @@ results.
   "Title": "My Paper",
   "Task": "Read the paper, public reviews, and code. Reproduce the main result, address the reviewer concerns with real experiments, revise the paper, and continue iterating with the AI Reviewer.",
   "Paper": {
-    "local_path": "/path/to/paper/main.tex",
-    "code_path": "/path/to/code"
+    "local_path": "my-paper/paper-source",
+    "code_path": "my-paper/code"
   },
   "Human_Reviews_From_OpenReview": {
-    "source_file": "/path/to/reviews.md"
+    "source_file": "my-paper/reviews.md"
   },
   "What_NOT_To_Do": "Do not fabricate results, citations, or experiments.",
   "GPU_Needed": false
 }
 ```
 
-Reviews may instead be stored directly in the JSON as an object, list, or string.
+<details>
+<summary><strong>No reviews, no code, or GPU experiments?</strong></summary>
 
-#### When public reviews are not available
+| Your case | JSON change |
+| --- | --- |
+| No existing reviews | Set `"Human_Reviews_From_OpenReview": false`. |
+| No experiment code | Remove `code_path`; describe what can be reproduced in `Task`. |
+| GPU experiments | Set `"GPU_Needed": true`. |
 
-Set the review field to `false`:
+For papers without reviews, use this `Task`.
 
-```json
-{
-  "Name": "my_paper",
-  "Title": "My Paper",
-  "Task": "Read the paper and code. Reproduce the main result, use Search to find the most important gaps, run evidence-backed improvements, revise the paper, and iterate with the AI Reviewer.",
-  "Paper": {
-    "local_path": "/path/to/paper/main.tex",
-    "code_path": "/path/to/code"
-  },
-  "Human_Reviews_From_OpenReview": false,
-  "What_NOT_To_Do": "Do not fabricate results, citations, or experiments.",
-  "GPU_Needed": false
-}
-```
+> Read the paper and code. Reproduce the main result, use Search to find gaps, test improvements with experiments, revise the paper, and iterate with the AI Reviewer.
 
-You can also provide a public paper URL instead of local files. See
-[Paper task files](docs/paper-task-files.md) for all supported input forms and complete examples.
+[Other input formats and complete examples](docs/paper-task-files.md).
 
-## Run TheAppliedScientist
+</details>
 
-Docker without GPU:
+### 6. Start TheAppliedScientist
+
+From the **repository root**, run the command for your runtime.
 
 ```bash
+# Docker
 ./tas run components/ai-scientist/user-ideas/my-paper.json -- --timeout 21600
-```
 
-Docker with GPU, after the verification command above:
-
-```bash
-./tas run components/ai-scientist/user-ideas/my-paper.json -- --timeout 21600 --gpus 1
-```
-
-Native mode:
-
-```bash
+# Native, without Docker
 ./tas run --runtime native components/ai-scientist/user-ideas/my-paper.json -- --timeout 21600
 ```
 
-The paper JSON is checked automatically before every job.
+For GPU experiments in Docker, complete [NVIDIA setup](docs/installation.md#nvidia-gpu), then add `--gpus 1`. Native mode uses host devices directly.
 
-To check it without starting a run:
+**Run limit:** six hours in these examples
 
-```bash
-./tas validate components/ai-scientist/user-ideas/my-paper.json
-```
+**Outputs**
 
-TheAppliedScientist saves each run under:
+`components/ai-scientist/jobs/my-paper__<timestamp>/`
 
-```text
-TheAppliedScientist/components/ai-scientist/jobs/my-paper__<timestamp>/
-```
+Experiment code · results · figures · paper source/PDF · review history · agent trajectory.
 
-The run directory contains the experiment code, results, figures, LaTeX
-source, compiled PDF, review history, and agent trajectory.
+<a name="run-individual-components"></a>
 
-## How the system works
+## ![Run individual components](docs/assets/section-components.svg)
+
+Install the [prerequisites](docs/installation.md), then choose what to run.
+
+| Component | Install | Start |
+| --- | --- | --- |
+| Search API | `./tas setup search --runtime native` | `./tas up search` |
+| AI Reviewer | `./tas setup reviewer --runtime docker` | `./tas up reviewer` |
+| AI Scientist | `./tas setup scientist --runtime docker` | `./tas run components/ai-scientist/user-ideas/my-paper.json` |
+
+Use `--runtime native` for Reviewer or Scientist without Docker. Setup asks only for the selected components' credentials.
+
+| Component | Required APIs |
+| --- | --- |
+| AI Reviewer | A running Search API |
+| AI Scientist | Running Search and Review APIs |
+
+[Set the service URLs / use separate machines](docs/deployment.md#individual-components) · [Host your own public APIs and MCPs](deploy/hosted/README.md)
+
+## How it works
 
 <p align="center">
-  <img src="docs/assets/figure-1-system.svg" alt="TheAppliedScientist system architecture" width="100%">
+  <img src="docs/assets/figure-1-system.svg" alt="TheAppliedScientist research and review loop" width="100%">
 </p>
 
-TheAppliedScientist combines three components. They can run together on one
-machine or communicate over the network from separate machines.
+The Scientist runs experiments and revises the paper. Each independent review guides the next revision. Code, results, and drafts carry forward.
 
-| Component | Purpose | Default port |
-|---|---|---:|
-| Search API | Searches the paper index, follows citations, and reads full papers | 8081 |
-| AI Reviewer | Independently reads, checks, and scores each manuscript | 8082 |
-| AI Scientist | Runs experiments, writes the paper, and acts on reviews | On demand |
+<a name="documentation"></a>
 
-## Deployment and configuration
-
-### Deploy selected components
-
-Each component can be installed by itself:
-
-```bash
-./tas setup search --runtime native
-./tas setup reviewer --runtime docker
-./tas setup scientist --runtime docker
-```
-
-This is useful when Search, Reviewer, and Scientist run on different machines.
-See [Deployment](docs/deployment.md) for complete machine-by-machine instructions.
-To operate a public Search, Reviewer, and MCP server, see the
-[hosted deployment guide](deploy/hosted/README.md).
-
-### Configure LLM endpoints
-
-Reviewer and the default Scientist use Claude Code. Their endpoint must implement
-the Anthropic Messages API, including streaming and tool calls.
-
-```dotenv
-ANTHROPIC_BASE_URL=https://provider.example/anthropic
-ANTHROPIC_API_KEY=your-key
-ANTHROPIC_MODEL=provider-model-name
-```
-
-Direct Anthropic, DeepSeek's Anthropic endpoint, and other Anthropic-compatible
-gateways use this same interface. An OpenAI-only endpoint needs an
-OpenAI-to-Anthropic converter. OpenAI-format integrations use the separate
-`OPENAI_*` settings.
-
-Search requires `GEMINI_API_KEY` because the published vectors were created with
-Gemini Embedding 2. See [LLM endpoints](docs/llm-providers.md) for provider-specific
-configuration.
-
-## Commands
-
-```bash
-./tas doctor              # check configuration
-./tas status              # show service health
-./tas smoke               # run a real search and health checks
-./tas logs search         # follow Search logs
-./tas logs reviewer       # follow Reviewer logs
-./tas down                # stop services
-```
-
-## Documentation
+## ![Documentation](docs/assets/section-docs.svg)
 
 | Guide | Contents |
-|---|---|
-| [Paper task files](docs/paper-task-files.md) | Paper, code, review, URL, and no-review inputs |
-| [Deployment](docs/deployment.md) | Docker, native, and separate-machine setup |
-| [LLM endpoints](docs/llm-providers.md) | Anthropic and OpenAI wire formats |
-| [Experiment compatibility](docs/reproducing-experiments.md) | Reference prompts, versions, and locked files |
+| --- | --- |
+| [Hosted MCPs](docs/hosted-tools.md) | Supported files, usage, review limits |
+| [Installation](docs/installation.md) | Linux, macOS, Windows/WSL, Docker, native, GPU |
+| [API keys and models](docs/llm-providers.md) | Gemini embeddings, Search answer models, agent endpoints |
+| [Deployment](docs/deployment.md) | Individual components, separate machines, service commands |
+| [Paper inputs](docs/paper-task-files.md) | Source, code, reviews, public URLs |
+| [Original experiment setup](docs/reproducing-experiments.md) | Reference prompts, versions, compatibility checks |
 
-## Security
-
-Keep `.env` private. Docker mode mounts the Docker socket for experiment
-containers. Native mode executes research commands on the host. Review paper
-tasks and input code before running them.
-
-Sanitize trajectories before publishing them:
+<details>
+<summary><strong>Service commands and sharing outputs</strong></summary>
 
 ```bash
-python components/ai-scientist/scripts/sanitize_secrets.py --help
+./tas status          # service health
+./tas doctor          # configuration checks
+./tas logs search     # follow Search logs
+./tas logs reviewer   # follow Reviewer logs
+./tas down            # stop services
 ```
 
-## License
+Docker research jobs can control Docker through its socket. Native jobs execute on the host. Use a dedicated research machine; keep `.env` and raw trajectories private. [Publishing outputs safely](docs/deployment.md#outputs-and-secrets).
 
-MIT. Vendored code keeps its original license notices.
+</details>
+
+[MIT license](LICENSE). Bundled dependencies retain their original notices.
